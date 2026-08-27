@@ -1,0 +1,7 @@
+{"name": "append_nil_thm", "statement": "theorem append_nil_thm (xs : List Nat) : xs ++ [] = xs"}
+{"name": "reverse_reverse_thm", "statement": "theorem reverse_reverse_thm (xs : List Nat) : xs.reverse.reverse = xs"}
+{"name": "and_swap", "statement": "theorem and_swap (a b : Prop) (h : a ∧ b) : b ∧ a"}
+{"name": "or_swap", "statement": "theorem or_swap (a b : Prop) (h : a ∨ b) : b ∨ a"}
+{"name": "imp_chain", "statement": "theorem imp_chain (p q r : Prop) (hpq : p → q) (hqr : q → r) (hp : p) : r"}
+{"name": "imp_trans2", "statement": "theorem imp_trans2 (p q r s : Prop) (h1 : p → q) (h2 : q → r) (h3 : r → s) : p → s"}
+{"name": "or_assoc_thm", "statement": "theorem or_assoc_thm (a b c : Prop) (h : (a ∨ b) ∨ c) : a ∨ (b ∨ c)"}

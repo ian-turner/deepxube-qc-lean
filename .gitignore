@@ -1,0 +1,9 @@
+.venv/
+vendor/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+results/
+lean/testproj/.lake/
+.DS_Store
+*.swp
