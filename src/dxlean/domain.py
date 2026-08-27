@@ -11,18 +11,21 @@ the instance's frontier then drains and the search reports it unsolved.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
-from deepxube.base.domain import ActsEnum
+from deepxube.base.domain import ActsEnum, StateGoalVizable, StringToAct
+from matplotlib.figure import Figure
 
-from .providers import ActionProvider, ProposalRequest
+from .providers import ActionProvider, Candidate, ProposalRequest
 from .repl import REPLManager
 from .states import LeanGoal, LeanState, TacticAction, TheoremSpec
 
 StateKey = Tuple[str, str]
 
 
-class LeanDomain(ActsEnum[LeanState, TacticAction, LeanGoal]):
+class LeanDomain(ActsEnum[LeanState, TacticAction, LeanGoal],
+                 StateGoalVizable[LeanState, TacticAction, LeanGoal],
+                 StringToAct[LeanState, TacticAction, LeanGoal]):
     def __init__(self, repl: REPLManager, provider: ActionProvider,
                  theorems: Dict[str, TheoremSpec], verbose: bool = False):
         super().__init__()
@@ -55,15 +58,16 @@ class LeanDomain(ActsEnum[LeanState, TacticAction, LeanGoal]):
         if reqs:
             cands_l = self.provider.propose(reqs)
             for i, cands in zip(todo, cands_l):
-                self._expand_one(states[i], [c.tactic for c in cands])
+                self._expand_one(states[i], cands)
 
         return [[] if s.solved else list(self._actions.get(s.key, [])) for s in states]
 
-    def _expand_one(self, state: LeanState, tactics: List[str]) -> None:
+    def _expand_one(self, state: LeanState, cands: List[Candidate]) -> None:
         self.stats["expansions"] += 1
         failed = self._failed.setdefault(state.key, set())
         valid: List[TacticAction] = []
-        for tac in tactics:
+        for cand in cands:
+            tac = cand.tactic
             if tac in failed:
                 continue
             self.stats["validations"] += 1
@@ -74,7 +78,7 @@ class LeanDomain(ActsEnum[LeanState, TacticAction, LeanGoal]):
                     failed.add(tac)
                     continue
                 self.stats["valid"] += 1
-                valid.append(TacticAction(tac))
+                valid.append(TacticAction(tac, cand.provenance, cand.score))
                 self._successor[(state.key, tac)] = res.state
             else:
                 if res.status == "no_progress":
@@ -88,7 +92,7 @@ class LeanDomain(ActsEnum[LeanState, TacticAction, LeanGoal]):
                     print(f"[dxlean]   {state.thm_name}: {tac!r} -> {res.status}: {res.message[:100]}")
         self._actions[state.key] = valid
         if self.verbose:
-            print(f"[dxlean] expanded {state}: {len(valid)}/{len(tactics)} tactics valid")
+            print(f"[dxlean] expanded {state}: {len(valid)}/{len(cands)} tactics valid")
 
     def next_state(self, states: List[LeanState], actions: List[TacticAction]) -> Tuple[List[LeanState], List[float]]:
         out: List[LeanState] = []
@@ -108,3 +112,27 @@ class LeanDomain(ActsEnum[LeanState, TacticAction, LeanGoal]):
 
     def sample_problem_instances(self, num_steps_l, times=None):
         raise NotImplementedError("dxlean v1 feeds problem instances directly; no generator")
+
+    # -- introspection (used by viz) -----------------------------------------
+
+    def expanded(self, state: LeanState) -> bool:
+        return state.key in self._actions
+
+    def valid_actions(self, state: LeanState) -> Optional[List[TacticAction]]:
+        return self._actions.get(state.key)
+
+    def failed_tactics(self, state: LeanState) -> Set[str]:
+        return set(self._failed.get(state.key, ()))
+
+    # -- deepxube visualization mixins ---------------------------------------
+
+    def visualize_state_goal(self, state: LeanState, goal: LeanGoal, fig: Figure) -> None:
+        from .viz import render_state_goal
+        render_state_goal(state, goal, fig)
+
+    def string_to_action(self, act_str: str) -> Optional[TacticAction]:
+        act_str = act_str.strip()
+        return TacticAction(act_str, "user") if act_str else None
+
+    def string_to_action_help(self) -> str:
+        return "Any Lean 4 tactic, e.g. 'simp', 'omega', 'intro h', 'exact h.2' (validated by the REPL on apply)"

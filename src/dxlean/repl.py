@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -208,6 +209,11 @@ class REPLManager:
         low = tactic.lower()
         if any(b in low for b in BANNED_SUBSTRINGS):
             return ApplyResult("error", None, f"banned tactic: {tactic!r}")
+        # The theorem is declared `:= by sorry`, so its own (sorry-backed) constant
+        # exists in the search-time environment: referencing it is a circular proof
+        # that certification would reject. Refuse it up front.
+        if re.search(rf"(?<![A-Za-z0-9_.']){re.escape(state.thm_name)}(?![A-Za-z0-9_'])", tactic):
+            return ApplyResult("error", None, f"self-reference to {state.thm_name!r}")
         try:
             ps = self._ensure_ps(state)
             resp = self._request({"tactic": tactic, "proofState": ps}, self.tactic_timeout)

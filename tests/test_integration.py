@@ -103,3 +103,20 @@ def test_solve_multistep_with_fake_llm(repl):
     assert result.solved and result.verified
     assert result.tactics == ["intro hp", "apply h3", "apply h2", "apply h1", "exact hp"]
     assert client.n_calls >= 5
+
+
+def test_self_reference_rejected(repl):
+    """`theorem X := by sorry` puts a sorry-backed `X` in the search env; using
+    it is a circular proof that certification rejects — so the tactic gate must
+    refuse it up front (found live: llama3 proposed `apply and_swap`)."""
+    thm = TheoremSpec("tst_selfref", "theorem tst_selfref (a b : Prop) (h : a ∧ b) : b ∧ a")
+    root = repl.init_theorem(thm)
+
+    res = repl.apply_tactic(root, "apply tst_selfref")
+    assert res.status == "error" and "self-reference" in res.message
+    assert repl.apply_tactic(root, "exact tst_selfref a b h").status == "error"
+    # names that merely contain the theorem name are fine
+    assert repl.apply_tactic(root, "exact tst_selfref' h").status == "error"  # unknown ident, but NOT self-ref
+    assert "self-reference" not in repl.apply_tactic(root, "exact tst_selfref' h").message
+    # and normal progress still works
+    assert repl.apply_tactic(root, "constructor").status == "ok"

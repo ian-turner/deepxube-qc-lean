@@ -49,6 +49,11 @@ flow through `ActsEnum.expand` — see tests).
   `check_full_proof` — fresh elaboration of the assembled script; `sorry`/`admit`/
   `native_decide` banned. Failure taxonomy: ok / solved / error / **no_progress**
   (tactic succeeded, state unchanged — filtered to prevent self-loops) / timeout.
+  **Self-reference guard**: the theorem is declared `:= by sorry`, so its own
+  sorry-backed constant exists in the search-time environment; tactics mentioning
+  the theorem's name are rejected at the gate (found live — llama3 proposed
+  `apply and_swap` inside `and_swap` and search "solved" it; certification in the
+  pristine header env rejected it, and now search never accepts it either).
 - `providers.py` — `ActionProvider` ABC (batch propose), `BackboneProvider` (fixed
   menu; guaranteed recall on routine closers), `LLMSampler` (prompt → k tactics, one
   per line; parses/normalizes/filters), `UnionProvider` (order-preserving dedupe, cap).
@@ -61,7 +66,14 @@ flow through `ActsEnum.expand` — see tests).
   batch across the whole frontier); finished instances → path extraction
   (`get_path`) → certification → `SolveResult`.
 - `cli.py` — `dxlean solve` with knobs for backbone menu, endpoint/model, value
-  choice, W/B/eps/k/cap/itr-max, results + verified-proof output.
+  choice, W/B/eps/k/cap/itr-max, results + verified-proof output; `dxlean viz`
+  for the views below.
+- `viz.py` — visualization of the environment and search process, all text-first
+  on the REPL's pretty-printed goals: `render_state_goal` (matplotlib figure —
+  backs the deepxube `StateGoalVizable` mixin on `LeanDomain`, which also
+  implements `StringToAct`), `interactive` (proof shell with provider proposals
+  and undo), `traced_search` (per-iteration narration + search-tree print;
+  deepxube keeps the tree in `Node.edge_dict`, so the tree view is a free walk).
 
 ## Verified deepxube integration points
 

@@ -54,3 +54,22 @@ expanded per search iteration per theorem), `--k` (LLM samples per state), `--ca
 
 Results land in `--out`: `results.jsonl` plus `proofs/<name>.lean` for every proof
 that passed certification.
+
+## Visualization
+
+```bash
+# watch the search think: per-iteration narration (popped node, f=W*g+h, which
+# candidates validated, provenance) + final search tree with the solution path starred
+dxlean viz --problems problems/dev.jsonl --name and_swap --no-llm \
+    --backbone "intro h,constructor,assumption,rfl,omega"
+
+# interactive proof shell: type tactics, :p asks providers for validated
+# proposals, :u undoes, :g reprints goals, :q quits
+dxlean viz --problems problems/dev.jsonl --name or_swap --interactive
+
+# render the root state/goal as a matplotlib figure (deepxube StateGoalVizable)
+dxlean viz --problems problems/dev.jsonl --name and_swap --no-llm --fig root.png
+```
+
+Tree legend: `★` solution path, `✓` solved state, `✗` expanded dead end (no valid
+tactics), `·` generated but never expanded.
