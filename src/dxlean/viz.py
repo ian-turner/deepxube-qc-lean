@@ -266,6 +266,7 @@ def traced_search(theorem: TheoremSpec, repl: REPLManager, domain: LeanDomain,
     else:
         print(f"\nUNSOLVED after {instance.itr} iterations "
               f"({'frontier exhausted' if instance.frontier_size() == 0 else 'iteration limit'})")
+    print("stats: " + ", ".join(f"{k}={v}" for k, v in domain.stats.items()))
 
     if fig_path is not None:
         outcome = f"SOLVED: {' ; '.join(tactics)}" if solved else "UNSOLVED"

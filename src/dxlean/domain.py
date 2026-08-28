@@ -4,10 +4,14 @@ The usual deepxube pattern is inverted: tactic applicability is only decidable
 by running the tactic, so `get_state_actions` does the real work
 (propose -> REPL-validate -> cache successors) and `next_state` is a pure
 cache lookup. Failed tactics feed a per-state negative cache that is surfaced
-back to providers on re-expansion.
+back to providers on re-proposal.
 
-States that produce zero valid tactics simply return an empty action list;
-the instance's frontier then drains and the search reports it unsolved.
+A state whose every candidate fails is re-proposed up to `max_resamples` times
+in the same call, with the failed tactics surfaced back to the providers (LLM
+samplers put them in the prompt), so one bad sample round from a stochastic
+provider does not permanently kill the state. A state still empty after that
+returns an empty action list; the instance's frontier then drains and the
+search reports it unsolved.
 """
 from __future__ import annotations
 
@@ -27,40 +31,51 @@ class LeanDomain(ActsEnum[LeanState, TacticAction, LeanGoal],
                  StateGoalVizable[LeanState, TacticAction, LeanGoal],
                  StringToAct[LeanState, TacticAction, LeanGoal]):
     def __init__(self, repl: REPLManager, provider: ActionProvider,
-                 theorems: Dict[str, TheoremSpec], verbose: bool = False):
+                 theorems: Dict[str, TheoremSpec], verbose: bool = False,
+                 max_resamples: int = 2):
         super().__init__()
         self.repl = repl
         self.provider = provider
         self.theorems = theorems
         self.verbose = verbose
+        self.max_resamples = max_resamples
 
         self._actions: Dict[StateKey, List[TacticAction]] = {}
         self._successor: Dict[Tuple[StateKey, str], LeanState] = {}
         self._failed: Dict[StateKey, Set[str]] = {}
         self.stats: Dict[str, int] = {
             "expansions": 0, "validations": 0, "valid": 0,
-            "errors": 0, "no_progress": 0, "timeouts": 0,
+            "errors": 0, "no_progress": 0, "timeouts": 0, "resamples": 0,
         }
 
     # -- deepxube Domain interface -------------------------------------------
 
     def get_state_actions(self, states: List[LeanState]) -> List[List[TacticAction]]:
-        # build proposal batch for states that need expansion
-        todo: List[int] = []
-        reqs: List[ProposalRequest] = []
-        for i, s in enumerate(states):
-            if s.solved or s.key in self._actions:
-                continue
-            todo.append(i)
-            failed = tuple(sorted(self._failed.get(s.key, ())))
-            reqs.append(ProposalRequest(s, self.theorems[s.thm_name], failed))
-
-        if reqs:
-            cands_l = self.provider.propose(reqs)
-            for i, cands in zip(todo, cands_l):
-                self._expand_one(states[i], cands)
+        need = [s for s in states if not s.solved and s.key not in self._actions]
+        self._propose_round(need)
+        # a freshly expanded state whose every candidate failed gets re-proposed
+        # with the failed tactics surfaced back to the providers, so one bad
+        # sample round does not permanently dead-end it
+        for _ in range(self.max_resamples):
+            dead = [s for s in need if not self._actions.get(s.key)]
+            if not dead:
+                break
+            self.stats["resamples"] += len(dead)
+            if self.verbose:
+                for s in dead:
+                    print(f"[dxlean] resampling dead end {s}")
+            self._propose_round(dead)
 
         return [[] if s.solved else list(self._actions.get(s.key, [])) for s in states]
+
+    def _propose_round(self, states: List[LeanState]) -> None:
+        if not states:
+            return
+        reqs = [ProposalRequest(s, self.theorems[s.thm_name],
+                                tuple(sorted(self._failed.get(s.key, ()))))
+                for s in states]
+        for s, cands in zip(states, self.provider.propose(reqs)):
+            self._expand_one(s, cands)
 
     def _expand_one(self, state: LeanState, cands: List[Candidate]) -> None:
         self.stats["expansions"] += 1

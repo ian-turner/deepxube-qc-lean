@@ -69,6 +69,14 @@ dxlean viz --problems problems/dev.jsonl --name or_swap --interactive
 
 # render the root state/goal as a matplotlib figure (deepxube StateGoalVizable)
 dxlean viz --problems problems/dev.jsonl --name and_swap --no-llm --fig root.png
+
+# LLM-only search (no backbone menu): every tactic in the trace and tree is
+# tagged [llm]. When every sample fails, the state is re-proposed with the
+# failed tactics fed back to the sampler (--resamples, default 2) before it
+# becomes a dead end; low temperature still helps small models.
+dxlean viz --problems problems/dev.jsonl --name imp_chain \
+    --endpoint http://localhost:11434/v1 --model qwen2.5-coder:7b \
+    --backbone "" --temperature 0.2 --itr-max 25 --fig imp_chain_llm.png
 ```
 
 Tree legend: `★` solution path, `✓` solved state, `✗` expanded dead end (no valid

@@ -60,6 +60,8 @@ def _add_common_args(s: argparse.ArgumentParser) -> None:
     s.add_argument("--k", type=int, default=8, help="LLM tactic samples per state")
     s.add_argument("--temperature", type=float, default=0.7)
     s.add_argument("--cap", type=int, default=24, help="max candidates validated per state")
+    s.add_argument("--resamples", type=int, default=2,
+                   help="re-proposal rounds (failed tactics fed back) before a state is a dead end")
     s.add_argument("--weight", type=float, default=1.0, help="weight on path cost (W*g + h); lower = greedier")
     s.add_argument("--batch", type=int, default=1, help="nodes expanded per search iteration per instance")
     s.add_argument("--eps", type=float, default=0.0, help="chance of random pop (exploration)")
@@ -106,7 +108,8 @@ def _cmd_solve(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     repl, provider, value = _build(p, args)
     repl.start()
     try:
-        domain = LeanDomain(repl, provider, {t.name: t for t in theorems})
+        domain = LeanDomain(repl, provider, {t.name: t for t in theorems},
+                            max_resamples=args.resamples)
         results = solve(theorems, repl, domain, value, weight=args.weight,
                         batch_size=args.batch, eps=args.eps, itr_max=args.itr_max,
                         verbose=not args.quiet)
@@ -153,7 +156,8 @@ def _cmd_viz(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
         if args.interactive:
             viz.interactive(repl, provider, thm, value_provider=value)
         else:
-            domain = LeanDomain(repl, provider, {thm.name: thm})
+            domain = LeanDomain(repl, provider, {thm.name: thm},
+                                max_resamples=args.resamples)
             viz.traced_search(thm, repl, domain, value, weight=args.weight,
                               batch_size=args.batch, eps=args.eps, itr_max=args.itr_max,
                               fig_path=args.fig)

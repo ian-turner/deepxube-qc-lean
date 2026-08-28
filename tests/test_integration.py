@@ -105,6 +105,36 @@ def test_solve_multistep_with_fake_llm(repl):
     assert client.n_calls >= 5
 
 
+def test_resample_recovers_from_bad_round(repl):
+    """One bad LLM sample round must not permanently dead-end a state: the
+    domain re-proposes with the failed tactics fed back to the sampler (found
+    live: qwen2.5-coder proposed only junk for and_swap's root and the search
+    died at iteration 0, frontier exhausted)."""
+    from dxlean.llm import FakeChatClient
+    from dxlean.providers import LLMSampler, UnionProvider
+
+    thm = TheoremSpec("tst_resample", "theorem tst_resample (a b : Prop) (h : a ∧ b) : b ∧ a")
+
+    def respond(system: str, user: str) -> str:
+        if "already FAILED" in user:
+            return "exact ⟨h.2, h.1⟩"
+        return "exact h.1\nexact h.2"
+
+    provider = UnionProvider([LLMSampler(FakeChatClient(respond), k=4)], cap=8)
+    domain = LeanDomain(repl, provider, {thm.name: thm})
+    root = repl.init_theorem(thm)
+    (acts,) = domain.get_state_actions([root])
+    assert [a.tactic for a in acts] == ["exact ⟨h.2, h.1⟩"]
+    assert domain.stats["resamples"] == 1
+    assert domain.failed_tactics(root) == {"exact h.1", "exact h.2"}
+
+    # with resampling disabled, the same bad round is a permanent dead end
+    provider0 = UnionProvider([LLMSampler(FakeChatClient(respond), k=4)], cap=8)
+    domain0 = LeanDomain(repl, provider0, {thm.name: thm}, max_resamples=0)
+    (acts0,) = domain0.get_state_actions([repl.init_theorem(thm)])
+    assert acts0 == [] and domain0.stats["resamples"] == 0
+
+
 def test_self_reference_rejected(repl):
     """`theorem X := by sorry` puts a sorry-backed `X` in the search env; using
     it is a circular proof that certification rejects — so the tactic gate must
