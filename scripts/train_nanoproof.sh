@@ -26,6 +26,10 @@
 #   NP_WARMUP_WAIT    seconds to let leanserver import Mathlib before RL/eval (default 900)
 #   NP_PORT           leanserver port                (default 8000)
 #   NP_FORCE          1 = re-run a training stage even if it already has a checkpoint
+#   NP_SAVE_EVERY     pretrain checkpoint interval in steps (default 2000, ~every 4h
+#                     at depth 26; -1 = only at end). Each save is ~5GB (model +
+#                     optimizer) and old saves are not pruned automatically; safe to
+#                     delete older model_/optim_ pairs, keep the newest for resume.
 #
 # Caveats: written against nanoproof/leantree main as of 2026-08; not smoke-tested
 # end-to-end here. Nemotron-CC-Math is gated: accept terms on HuggingFace and
@@ -51,6 +55,7 @@ PSS_RECYCLE="${NP_PSS_RECYCLE_GIB:-6}"
 WARMUP_WAIT="${NP_WARMUP_WAIT:-900}"
 PORT="${NP_PORT:-8000}"
 FORCE="${NP_FORCE:-0}"
+SAVE_EVERY="${NP_SAVE_EVERY:-2000}"
 
 LEAN_VERSION="v4.27.0"   # pinned by leantree/nanoproof (dataset whitelists, REPL fork)
 REPL_EXE="$LT_REPO/lean-repl/.lake/build/bin/repl"
@@ -156,12 +161,28 @@ do_smoke() {
 
 # ------------------------------------------------------------- training ------
 
+# Pretrain saves intermediate checkpoints (NP_SAVE_EVERY), so "a checkpoint
+# exists" no longer means "finished". Completion is tracked by a marker file
+# written only when the training process exits successfully; anything short
+# of that resumes from the newest checkpoint on the next run.
 do_pretrain() {
-    if stage_done pretrain; then log "pretrain: checkpoint exists, skipping (NP_FORCE=1 to redo)"; return; fi
-    log "pretrain: depth=$DEPTH on Nemotron-CC-Math (~20B tokens; expect ~3-4 days at depth 26)"
-    local fp8_flag=""
+    local marker="$NANOPROOF_HOME/models/pretrain/.complete"
+    if [ "$FORCE" = 1 ]; then
+        rm -f "$marker"
+    elif [ -f "$marker" ]; then
+        log "pretrain: complete, skipping (NP_FORCE=1 to redo)"; return
+    fi
+    local fp8_flag="" resume_flag="" ckpt
     [ "$FP8" = 1 ] && fp8_flag="--fp8"
-    ( cd "$NP_REPO" && "$PY" -m nanoproof.pretrain --depth="$DEPTH" $fp8_flag )
+    ckpt="$(latest_ckpt pretrain)"
+    if [ -n "$ckpt" ] && [ "$FORCE" != 1 ]; then
+        log "pretrain: resuming from $ckpt"
+        resume_flag="--resume-from=$ckpt"
+    fi
+    log "pretrain: depth=$DEPTH on Nemotron-CC-Math (~20B tokens; expect ~3-4 days at depth 26)"
+    ( cd "$NP_REPO" && "$PY" -m nanoproof.pretrain --depth="$DEPTH" \
+        --save-every="$SAVE_EVERY" $fp8_flag $resume_flag )
+    touch "$marker"
 }
 
 do_midtrain() {
