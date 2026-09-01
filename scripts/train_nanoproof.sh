@@ -32,7 +32,8 @@
 # `hf auth login` before the data stage. Run the `smoke` stage before burning GPU-days.
 set -euo pipefail
 
-WORK_DIR="${NP_WORK_DIR:-$HOME/nanoproof-train}"
+USER=`whoami`
+WORK_DIR="${NP_WORK_DIR:-/work/$USER}"
 NP_REPO="$WORK_DIR/nanoproof"
 LT_REPO="$WORK_DIR/leantree"
 LEAN_PROJECT="$WORK_DIR/nptraining"
