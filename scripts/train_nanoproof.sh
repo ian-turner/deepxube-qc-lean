@@ -67,9 +67,15 @@ SERVER_PID_FILE="$WORK_DIR/leanserver.pid"
 log() { printf '\n[train_nanoproof] %s\n' "$*"; }
 die() { printf '[train_nanoproof] ERROR: %s\n' "$*" >&2; exit 1; }
 
-# Newest checkpoint for a stage ($NANOPROOF_HOME/<stage>/<timestamped-run>/model_NNNNNN.pt)
+# Newest checkpoint for a stage ($NANOPROOF_HOME/models/<stage>/<run>/model_NNNNNN.pt).
+# Sort by mtime: run dir names are HH-MM-SS_DD-MM-YY, which does not sort
+# chronologically across days.
 latest_ckpt() {
-    find "$NANOPROOF_HOME/$1" -name 'model_*.pt' 2>/dev/null | sort | tail -1
+    local files
+    files=$(find "$NANOPROOF_HOME/models/$1" -name 'model_*.pt' 2>/dev/null)
+    [ -n "$files" ] || return 0
+    # shellcheck disable=SC2086  # run paths contain no whitespace
+    ls -t $files | head -1
 }
 
 stage_done() {  # skip a training stage that already produced a checkpoint
@@ -134,6 +140,18 @@ do_smoke() {
     ( cd "$NP_REPO" && "$PY" -m nanoproof.pretrain \
         --depth=4 --max-seq-len=512 --device-batch-size=1 \
         --eval-tokens=512 --total-batch-size=512 --num-iterations=20 )
+    # The smoke run writes a toy checkpoint into the shared models/pretrain
+    # namespace, which would satisfy stage_done and let midtrain chain from a
+    # depth-4 model. Remove it, but only after confirming it is the smoke run.
+    local run_dir
+    run_dir=$(ls -td "$NANOPROOF_HOME"/models/pretrain/*/ 2>/dev/null | head -1)
+    if [ -n "$run_dir" ] && grep -q '"depth": 4' \
+            "$NANOPROOF_HOME/logs/pretrain/$(basename "$run_dir")/args.json" 2>/dev/null; then
+        rm -rf "$run_dir"
+        log "smoke: removed toy checkpoint $run_dir"
+    elif [ -n "$run_dir" ]; then
+        log "WARNING: could not confirm $run_dir is the smoke run; not deleting it"
+    fi
 }
 
 # ------------------------------------------------------------- training ------
