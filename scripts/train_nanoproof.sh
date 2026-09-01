@@ -89,6 +89,12 @@ do_setup() {
     # Torch first from the CUDA wheel index so `pip install -e .` sees the pin
     # already satisfied and doesn't pull the default PyPI build.
     "$PY" -m pip install "$TORCH_SPEC" --index-url "$TORCH_INDEX"
+    # leantree from the local clone, NOT PyPI: the only wheel there is
+    # cp312+glibc>=2.39 and the sdist cannot build (its build script runs
+    # `lake build` in the lean-repl submodule, which the sdist omits). The
+    # clone has the submodule, so the same build script works here — and
+    # builds the REPL binary as a side effect.
+    "$PY" -m pip install "$LT_REPO"
     "$PY" -m pip install -e "$NP_REPO"
     "$PY" -m pip install pytest ruff   # nanoproof's dev group
 
