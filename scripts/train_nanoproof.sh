@@ -32,6 +32,10 @@
 # `hf auth login` before the data stage. Run the `smoke` stage before burning GPU-days.
 set -euo pipefail
 
+# Training progress is plain print(), which block-buffers under SLURM/pipes
+# and can look hung for many minutes; stream it live instead.
+export PYTHONUNBUFFERED=1
+
 WORK_DIR="${NP_WORK_DIR:-$HOME/nanoproof-train}"
 NP_REPO="$WORK_DIR/nanoproof"
 LT_REPO="$WORK_DIR/leantree"
