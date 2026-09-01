@@ -19,7 +19,8 @@
 #                     https://download.pytorch.org/whl/cpu on CPU-only hosts)
 #   NP_WORK_DIR       where repos/checkpoints live   (default /work/$USER)
 #   NP_DEPTH          transformer depth              (default 26, ~1B params; 20 halves cost)
-#   NP_FP8            1 = --fp8 for pretrain on H100+ (default 1)
+#   NP_FP8            --fp8 for pretrain: auto = only on compute capability >= 9.0
+#                     (Hopper: H100/H200); 1/0 force it on/off (default auto)
 #   NP_LEAN_PROCS     leanserver --max-processes     (default 24)
 #   NP_RSS_LIMIT_GIB  per-REPL-worker hard memory cap (default 16)
 #   NP_PSS_RECYCLE_GIB worker recycle threshold       (default 6)
@@ -48,7 +49,7 @@ LEAN_PROJECT="$WORK_DIR/nptraining"
 export NANOPROOF_HOME="${NANOPROOF_HOME:-$WORK_DIR/nanoproof-home}"
 
 DEPTH="${NP_DEPTH:-26}"
-FP8="${NP_FP8:-1}"
+FP8="${NP_FP8:-auto}"
 LEAN_PROCS="${NP_LEAN_PROCS:-24}"
 RSS_LIMIT="${NP_RSS_LIMIT_GIB:-16}"
 PSS_RECYCLE="${NP_PSS_RECYCLE_GIB:-6}"
@@ -172,7 +173,17 @@ do_pretrain() {
     elif [ -f "$marker" ]; then
         log "pretrain: complete, skipping (NP_FORCE=1 to redo)"; return
     fi
-    local fp8_flag="" resume_flag="" ckpt meta
+    local fp8_flag="" resume_flag="" ckpt meta cap
+    if [ "$FP8" = "auto" ]; then
+        # Triton's fp8e4nv kernels need Hopper+ (cc 9.0); on an A100 the run
+        # dies with "type fp8e4nv not supported in this architecture"
+        cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1)"
+        if [ -n "$cap" ] && awk -v c="$cap" 'BEGIN { exit !(c >= 9.0) }'; then
+            FP8=1; log "pretrain: fp8 enabled (compute capability $cap)"
+        else
+            FP8=0; log "pretrain: fp8 disabled (compute capability ${cap:-unknown} < 9.0)"
+        fi
+    fi
     [ "$FP8" = 1 ] && fp8_flag="--fp8"
     ckpt="$(latest_ckpt pretrain)"
     if [ -n "$ckpt" ] && [ "$FORCE" != 1 ]; then
