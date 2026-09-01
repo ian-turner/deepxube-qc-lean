@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end nanoproof training on a single H200.
+# End-to-end nanoproof training on one GPU node (H200, or one or more A100s).
 #
 # Pipeline: setup -> data -> tokenizer -> pretrain -> midtrain -> sft
 #           (default stops here: this is the fixed policy+value checkpoint dxlean needs)
@@ -19,7 +19,16 @@
 #                     https://download.pytorch.org/whl/cpu on CPU-only hosts)
 #   NP_WORK_DIR       where repos/checkpoints live   (default /work/$USER)
 #   NP_DEPTH          transformer depth              (default 26, ~1B params; 20 halves cost)
-#   NP_FP8            1 = --fp8 for pretrain on H100+ (default 1)
+#   NP_FP8            1 = --fp8 for pretrain (default 1). REQUIRES H100/H200;
+#                     set NP_FP8=0 on A100s or Triton dies with "type fp8e4nv
+#                     not supported in this architecture"
+#   NP_GPUS           GPUs for the training stages and RL; >1 launches via
+#                     torchrun DDP (default 1). Pick a count and keep it for the
+#                     whole pretrain: optimizer state is sharded per rank, so a
+#                     checkpoint cannot resume under a different GPU count.
+#   NP_DEVICE_BATCH   per-GPU --device-batch-size override (nanoproof default 32;
+#                     lower to 16 or 8 if 40GB A100s OOM — gradient accumulation
+#                     keeps the effective batch identical, just slower)
 #   NP_LEAN_PROCS     leanserver --max-processes     (default 24)
 #   NP_RSS_LIMIT_GIB  per-REPL-worker hard memory cap (default 16)
 #   NP_PSS_RECYCLE_GIB worker recycle threshold       (default 6)
@@ -56,6 +65,10 @@ WARMUP_WAIT="${NP_WARMUP_WAIT:-900}"
 PORT="${NP_PORT:-8000}"
 FORCE="${NP_FORCE:-0}"
 SAVE_EVERY="${NP_SAVE_EVERY:-2000}"
+GPUS="${NP_GPUS:-1}"
+DEVICE_BATCH="${NP_DEVICE_BATCH:-}"
+DB_FLAG=""
+[ -n "$DEVICE_BATCH" ] && DB_FLAG="--device-batch-size=$DEVICE_BATCH"
 
 LEAN_VERSION="v4.27.0"   # pinned by leantree/nanoproof (dataset whitelists, REPL fork)
 REPL_EXE="$LT_REPO/lean-repl/.lake/build/bin/repl"
@@ -85,6 +98,17 @@ latest_ckpt() {
 
 stage_done() {  # skip a training stage that already produced a checkpoint
     [ "$FORCE" != 1 ] && [ -n "$(latest_ckpt "$1")" ]
+}
+
+# Launch a nanoproof training module on NP_GPUS GPUs (torchrun DDP when > 1).
+run_train() {
+    local module="$1"; shift
+    if [ "$GPUS" -gt 1 ]; then
+        ( cd "$NP_REPO" && "$(dirname "$PY")/torchrun" --standalone \
+            --nproc_per_node="$GPUS" -m "$module" "$@" )
+    else
+        ( cd "$NP_REPO" && "$PY" -m "$module" "$@" )
+    fi
 }
 
 # ---------------------------------------------------------------- setup ------
@@ -186,9 +210,9 @@ do_pretrain() {
             log "WARNING: ignoring $ckpt (depth != $DEPTH or missing $(basename "$meta")); starting fresh — delete stale runs under $NANOPROOF_HOME/models/pretrain to silence this"
         fi
     fi
-    log "pretrain: depth=$DEPTH on Nemotron-CC-Math (~20B tokens; expect ~3-4 days at depth 26)"
-    ( cd "$NP_REPO" && "$PY" -m nanoproof.pretrain --depth="$DEPTH" \
-        --save-every="$SAVE_EVERY" $fp8_flag $resume_flag )
+    log "pretrain: depth=$DEPTH on Nemotron-CC-Math (~20B tokens), $GPUS GPU(s)"
+    run_train nanoproof.pretrain --depth="$DEPTH" \
+        --save-every="$SAVE_EVERY" $DB_FLAG $fp8_flag $resume_flag
     touch "$marker"
 }
 
@@ -197,7 +221,7 @@ do_midtrain() {
     local ckpt; ckpt="$(latest_ckpt pretrain)"
     [ -n "$ckpt" ] || die "no pretrain checkpoint found under $NANOPROOF_HOME/models/pretrain"
     log "midtrain: Lean GitHub corpus, from $ckpt"
-    ( cd "$NP_REPO" && "$PY" -m nanoproof.midtrain --model-path "$ckpt" )
+    run_train nanoproof.midtrain --model-path "$ckpt" $DB_FLAG
 }
 
 do_sft() {
@@ -205,7 +229,7 @@ do_sft() {
     local ckpt; ckpt="$(latest_ckpt midtrain)"
     [ -n "$ckpt" ] || die "no midtrain checkpoint found under $NANOPROOF_HOME/models/midtrain"
     log "sft: LeanTree Mathlib transitions, from $ckpt"
-    ( cd "$NP_REPO" && "$PY" -m nanoproof.sft --model-path "$ckpt" )
+    run_train nanoproof.sft --model-path "$ckpt" $DB_FLAG
     log "SFT done. Policy+value checkpoint: $(latest_ckpt sft)"
 }
 
@@ -275,12 +299,12 @@ do_rl() {
     [ -n "$ckpt" ] || ckpt="$(latest_ckpt sft)"
     [ -n "$ckpt" ] || die "no sft checkpoint; run training stages first"
     do_leanproj; do_leanserver
-    log "rl: single-GPU loop from $ckpt (monitor: http://localhost:5050)"
-    ( cd "$NP_REPO" && "$PY" -m nanoproof.rl \
+    log "rl: $GPUS-GPU loop from $ckpt (monitor: http://localhost:5050)"
+    run_train nanoproof.rl \
         --model-path "$ckpt" \
         --lean-servers "127.0.0.1:$PORT" \
         --lean-project "$LEAN_PROJECT" \
-        ${NP_RL_EXTRA_ARGS:-} )
+        ${NP_RL_EXTRA_ARGS:-}
 }
 
 do_eval() {
