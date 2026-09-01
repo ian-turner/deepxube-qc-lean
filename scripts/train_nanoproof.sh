@@ -151,10 +151,13 @@ do_sft() {
 
 do_leanproj() {
     log "leanproj: Lean $LEAN_VERSION project with Mathlib + formal_conjectures"
+    # pip-installed leantree has no bundled REPL, so repl_path must be explicit
+    [ -x "$REPL_EXE" ] || die "REPL fork not built; run the setup stage"
     if [ ! -d "$LEAN_PROJECT" ]; then
         ( cd "$WORK_DIR" && "$PY" -c "
 from leantree import LeanProject
-LeanProject.create('$LEAN_PROJECT', lean_version='$LEAN_VERSION', libraries=['mathlib'])
+LeanProject.create('$LEAN_PROJECT', lean_version='$LEAN_VERSION', libraries=['mathlib'],
+                   repl_path='$REPL_EXE')
 " )
     fi
     if ! grep -q formal_conjectures "$LEAN_PROJECT/lakefile.toml"; then
