@@ -77,8 +77,9 @@ do_setup() {
     log "setup: repos + pip install into $PY"
     command -v elan  >/dev/null || die "elan not found (https://github.com/leanprover/elan)"
     command -v nvidia-smi >/dev/null || log "WARNING: nvidia-smi not found; GPU stages will fail"
-    "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
-        || die "nanoproof needs python >= 3.10 (got: $("$PY" -V 2>&1))"
+    # leantree requires >=3.12; torch.compile requires <3.14
+    "$PY" -c 'import sys; sys.exit(0 if (3, 12) <= sys.version_info < (3, 14) else 1)' \
+        || die "need python 3.12 or 3.13, got $("$PY" -V 2>&1) — conda create -n nanoproof python=3.12"
     "$PY" -c 'import sys; sys.exit(0 if sys.prefix != sys.base_prefix or "conda" in sys.version.lower() or "CONDA_PREFIX" in __import__("os").environ else 1)' \
         || log "WARNING: $PY does not look like a conda/virtual env; installing into it anyway"
     mkdir -p "$WORK_DIR"
