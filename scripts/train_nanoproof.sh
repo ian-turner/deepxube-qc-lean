@@ -17,7 +17,7 @@
 #   NP_PYTHON         python to use (default: active env's `python`, i.e. your conda env)
 #   NP_TORCH_INDEX    PyTorch wheel index (default cu128 for H100/H200; use
 #                     https://download.pytorch.org/whl/cpu on CPU-only hosts)
-#   NP_WORK_DIR       where repos/checkpoints live   (default ~/nanoproof-train)
+#   NP_WORK_DIR       where repos/checkpoints live   (default /work/$USER)
 #   NP_DEPTH          transformer depth              (default 26, ~1B params; 20 halves cost)
 #   NP_FP8            1 = --fp8 for pretrain on H100+ (default 1)
 #   NP_LEAN_PROCS     leanserver --max-processes     (default 24)
@@ -36,7 +36,8 @@ set -euo pipefail
 # and can look hung for many minutes; stream it live instead.
 export PYTHONUNBUFFERED=1
 
-WORK_DIR="${NP_WORK_DIR:-$HOME/nanoproof-train}"
+USER=`whoami`
+WORK_DIR="${NP_WORK_DIR:-/work/$USER}"
 NP_REPO="$WORK_DIR/nanoproof"
 LT_REPO="$WORK_DIR/leantree"
 LEAN_PROJECT="$WORK_DIR/nptraining"
