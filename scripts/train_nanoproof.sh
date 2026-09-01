@@ -111,7 +111,10 @@ do_data() {
 from huggingface_hub import HfApi
 HfApi().whoami()
 EOF
-    ( cd "$NP_REPO" && "$PY" -m nanoproof.data.download )
+    # everything except midtrain: the download-all path includes leangithubraw,
+    # whose HF repo (Kripi/Lean-Github-Raw) was never published and 404s
+    ( cd "$NP_REPO" && "$PY" -m nanoproof.data.download pretrain sft rl bench )
+    # midtrain corpus is built locally instead (clones source repos; needs git)
     ( cd "$NP_REPO" && "$PY" -m nanoproof.data.midtrain.leangithubraw build )
 }
 
