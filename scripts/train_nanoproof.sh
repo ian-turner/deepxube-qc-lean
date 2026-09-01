@@ -15,8 +15,6 @@
 #
 # Knobs (env vars):
 #   NP_PYTHON         python to use (default: active env's `python`, i.e. your conda env)
-#   NP_REF            nanoproof git ref to download as tarball (default main)
-#   LEANREPL_REF      lean-repl fork ref (default: the commit leantree's submodule pins)
 #   NP_TORCH_INDEX    PyTorch wheel index (default cu128 for H100/H200; use
 #                     https://download.pytorch.org/whl/cpu on CPU-only hosts)
 #   NP_WORK_DIR       where repos/checkpoints live   (default ~/nanoproof-train)
@@ -36,10 +34,7 @@ set -euo pipefail
 
 WORK_DIR="${NP_WORK_DIR:-$HOME/nanoproof-train}"
 NP_REPO="$WORK_DIR/nanoproof"
-REPL_SRC="$WORK_DIR/lean-repl"
-NP_REF="${NP_REF:-main}"
-# lean-repl commit pinned by leantree's submodule (what the PyPI package expects)
-LEANREPL_REF="${LEANREPL_REF:-620bc68ed74bdffc35fe17116e68e0cc977f23cc}"
+LT_REPO="$WORK_DIR/leantree"
 LEAN_PROJECT="$WORK_DIR/nptraining"
 export NANOPROOF_HOME="${NANOPROOF_HOME:-$WORK_DIR/nanoproof-home}"
 
@@ -53,7 +48,7 @@ PORT="${NP_PORT:-8000}"
 FORCE="${NP_FORCE:-0}"
 
 LEAN_VERSION="v4.27.0"   # pinned by leantree/nanoproof (dataset whitelists, REPL fork)
-REPL_EXE="$REPL_SRC/.lake/build/bin/repl"
+REPL_EXE="$LT_REPO/lean-repl/.lake/build/bin/repl"
 
 # Python from the active (conda) environment; NP_PYTHON overrides.
 PY="${NP_PYTHON:-$(command -v python || true)}"
@@ -67,15 +62,6 @@ SERVER_PID_FILE="$WORK_DIR/leanserver.pid"
 log() { printf '\n[train_nanoproof] %s\n' "$*"; }
 die() { printf '[train_nanoproof] ERROR: %s\n' "$*" >&2; exit 1; }
 
-# fetch_tarball <github codeload url> <dest_dir>: git-free repo download
-fetch_tarball() {
-    local url="$1" dest="$2" tmp
-    tmp="$(mktemp -d "$WORK_DIR/fetch.XXXXXX")"
-    curl -fsSL "$url" | tar xz -C "$tmp"
-    mv "$tmp"/* "$dest"    # tarball contains a single <repo>-<ref> top dir
-    rmdir "$tmp"
-}
-
 # Newest checkpoint for a stage ($NANOPROOF_HOME/<stage>/<timestamped-run>/model_NNNNNN.pt)
 latest_ckpt() {
     find "$NANOPROOF_HOME/$1" -name 'model_*.pt' 2>/dev/null | sort | tail -1
@@ -88,9 +74,8 @@ stage_done() {  # skip a training stage that already produced a checkpoint
 # ---------------------------------------------------------------- setup ------
 
 do_setup() {
-    log "setup: repos (tarballs, no git needed) + pip install into $PY"
+    log "setup: repos + pip install into $PY"
     command -v elan  >/dev/null || die "elan not found (https://github.com/leanprover/elan)"
-    command -v curl  >/dev/null || die "curl not found"
     command -v nvidia-smi >/dev/null || log "WARNING: nvidia-smi not found; GPU stages will fail"
     "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
         || die "nanoproof needs python >= 3.10 (got: $("$PY" -V 2>&1))"
@@ -98,8 +83,8 @@ do_setup() {
         || log "WARNING: $PY does not look like a conda/virtual env; installing into it anyway"
     mkdir -p "$WORK_DIR"
 
-    [ -d "$NP_REPO" ] || fetch_tarball "https://codeload.github.com/Kripner/nanoproof/tar.gz/$NP_REF" "$NP_REPO"
-    [ -d "$REPL_SRC" ] || fetch_tarball "https://codeload.github.com/Kripner/lean-repl/tar.gz/$LEANREPL_REF" "$REPL_SRC"
+    [ -d "$NP_REPO" ] || git clone https://github.com/Kripner/nanoproof "$NP_REPO"
+    [ -d "$LT_REPO" ] || git clone --recurse-submodules https://github.com/Kripner/leantree "$LT_REPO"
 
     # Torch first from the CUDA wheel index so `pip install -e .` sees the pin
     # already satisfied and doesn't pull the default PyPI build.
@@ -110,7 +95,7 @@ do_setup() {
     # Build the LeanTree REPL fork (elan fetches the pinned toolchain automatically)
     if [ ! -x "$REPL_EXE" ]; then
         log "building lean-repl fork ($LEAN_VERSION)"
-        ( cd "$REPL_SRC" && lake build repl )
+        ( cd "$LT_REPO/lean-repl" && lake build repl )
     fi
 }
 
@@ -121,12 +106,7 @@ from huggingface_hub import HfApi
 HfApi().whoami()
 EOF
     ( cd "$NP_REPO" && "$PY" -m nanoproof.data.download )
-    # midtrain corpus: try the prebuilt HF copy first (no git); `build` clones
-    # each source repo with git
-    if ! ( cd "$NP_REPO" && "$PY" -m nanoproof.data.midtrain.leangithubraw download ); then
-        command -v git >/dev/null || die "leangithubraw HF download failed, and building it locally needs git (conda install -c conda-forge git)"
-        ( cd "$NP_REPO" && "$PY" -m nanoproof.data.midtrain.leangithubraw build )
-    fi
+    ( cd "$NP_REPO" && "$PY" -m nanoproof.data.midtrain.leangithubraw build )
 }
 
 do_tokenizer() {
@@ -171,8 +151,6 @@ do_sft() {
 
 do_leanproj() {
     log "leanproj: Lean $LEAN_VERSION project with Mathlib + formal_conjectures"
-    # lake fetches Mathlib/formal_conjectures over git; this is outside our control
-    command -v git >/dev/null || die "lake needs git to fetch Mathlib (conda install -c conda-forge git)"
     # pip-installed leantree has no bundled REPL, so repl_path must be explicit
     [ -x "$REPL_EXE" ] || die "REPL fork not built; run the setup stage"
     if [ ! -d "$LEAN_PROJECT" ]; then
