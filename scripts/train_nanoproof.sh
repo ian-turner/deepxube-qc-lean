@@ -5,7 +5,8 @@
 #           (default stops here: this is the fixed policy+value checkpoint dxlean needs)
 # Opt-in:   leanproj / leanserver / rl / eval  (the AlphaProof RL loop + MiniF2F)
 #
-# Usage:
+# Usage (run inside your conda env, e.g. `conda create -n nanoproof python=3.12`):
+#   conda activate nanoproof
 #   scripts/train_nanoproof.sh                 # setup..sft
 #   scripts/train_nanoproof.sh smoke           # tiny pipeline sanity check first!
 #   scripts/train_nanoproof.sh rl              # after sft; starts leanserver itself
@@ -13,6 +14,9 @@
 #   scripts/train_nanoproof.sh setup data      # run individual stages
 #
 # Knobs (env vars):
+#   NP_PYTHON         python to use (default: active env's `python`, i.e. your conda env)
+#   NP_TORCH_INDEX    PyTorch wheel index (default cu128 for H100/H200; use
+#                     https://download.pytorch.org/whl/cpu on CPU-only hosts)
 #   NP_WORK_DIR       where repos/checkpoints live   (default ~/nanoproof-train)
 #   NP_DEPTH          transformer depth              (default 26, ~1B params; 20 halves cost)
 #   NP_FP8            1 = --fp8 for pretrain on H100+ (default 1)
@@ -45,8 +49,13 @@ FORCE="${NP_FORCE:-0}"
 
 LEAN_VERSION="v4.27.0"   # pinned by leantree/nanoproof (dataset whitelists, REPL fork)
 REPL_EXE="$LT_REPO/lean-repl/.lake/build/bin/repl"
-PY="$NP_REPO/.venv/bin/python"
-LEANSERVER="$NP_REPO/.venv/bin/leanserver"
+
+# Python from the active (conda) environment; NP_PYTHON overrides.
+PY="${NP_PYTHON:-$(command -v python || true)}"
+[ -n "$PY" ] || { echo "no python on PATH — activate your conda env first" >&2; exit 1; }
+LEANSERVER="$(dirname "$PY")/leanserver"   # console script installed next to python
+TORCH_SPEC="torch==2.9.1"                  # pinned by nanoproof's pyproject.toml
+TORCH_INDEX="${NP_TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
 SERVER_LOG="$WORK_DIR/leanserver.log"
 SERVER_PID_FILE="$WORK_DIR/leanserver.pid"
 
@@ -65,16 +74,23 @@ stage_done() {  # skip a training stage that already produced a checkpoint
 # ---------------------------------------------------------------- setup ------
 
 do_setup() {
-    log "setup: repos + python env in $WORK_DIR"
-    command -v uv    >/dev/null || die "uv not found (https://docs.astral.sh/uv/)"
+    log "setup: repos + pip install into $PY"
     command -v elan  >/dev/null || die "elan not found (https://github.com/leanprover/elan)"
     command -v nvidia-smi >/dev/null || log "WARNING: nvidia-smi not found; GPU stages will fail"
+    "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
+        || die "nanoproof needs python >= 3.10 (got: $("$PY" -V 2>&1))"
+    "$PY" -c 'import sys; sys.exit(0 if sys.prefix != sys.base_prefix or "conda" in sys.version.lower() or "CONDA_PREFIX" in __import__("os").environ else 1)' \
+        || log "WARNING: $PY does not look like a conda/virtual env; installing into it anyway"
     mkdir -p "$WORK_DIR"
 
     [ -d "$NP_REPO" ] || git clone https://github.com/Kripner/nanoproof "$NP_REPO"
     [ -d "$LT_REPO" ] || git clone --recurse-submodules https://github.com/Kripner/leantree "$LT_REPO"
 
-    ( cd "$NP_REPO" && uv sync --extra gpu --group dev )
+    # Torch first from the CUDA wheel index so `pip install -e .` sees the pin
+    # already satisfied and doesn't pull the default PyPI build.
+    "$PY" -m pip install "$TORCH_SPEC" --index-url "$TORCH_INDEX"
+    "$PY" -m pip install -e "$NP_REPO"
+    "$PY" -m pip install pytest ruff   # nanoproof's dev group
 
     # Build the LeanTree REPL fork (elan fetches the pinned toolchain automatically)
     if [ ! -x "$REPL_EXE" ]; then
@@ -160,6 +176,8 @@ EOF
 }
 
 do_leanserver() {
+    [ -x "$LEANSERVER" ] || LEANSERVER="$(command -v leanserver || true)"
+    [ -n "$LEANSERVER" ] || die "leanserver not found; run the setup stage (installed with leantree)"
     [ -x "$REPL_EXE" ] || die "REPL fork not built; run the setup stage"
     [ -d "$LEAN_PROJECT/.lake" ] || die "Lean project not built; run the leanproj stage"
     if [ -f "$SERVER_PID_FILE" ] && kill -0 "$(cat "$SERVER_PID_FILE")" 2>/dev/null; then
