@@ -145,7 +145,7 @@ do_smoke() {
     # depth-4 model. Remove it, but only after confirming it is the smoke run.
     local run_dir
     run_dir=$(ls -td "$NANOPROOF_HOME"/models/pretrain/*/ 2>/dev/null | head -1)
-    if [ -n "$run_dir" ] && grep -q '"depth": 4' \
+    if [ -n "$run_dir" ] && grep -q '"depth": 4,' \
             "$NANOPROOF_HOME/logs/pretrain/$(basename "$run_dir")/args.json" 2>/dev/null; then
         rm -rf "$run_dir"
         log "smoke: removed toy checkpoint $run_dir"
@@ -159,14 +159,15 @@ do_smoke() {
 do_pretrain() {
     if stage_done pretrain; then log "pretrain: checkpoint exists, skipping (NP_FORCE=1 to redo)"; return; fi
     log "pretrain: depth=$DEPTH on Nemotron-CC-Math (~20B tokens; expect ~3-4 days at depth 26)"
-    local fp8_flag=(); [ "$FP8" = 1 ] && fp8_flag=(--fp8)
-    ( cd "$NP_REPO" && "$PY" -m nanoproof.pretrain --depth="$DEPTH" "${fp8_flag[@]}" )
+    local fp8_flag=""
+    [ "$FP8" = 1 ] && fp8_flag="--fp8"
+    ( cd "$NP_REPO" && "$PY" -m nanoproof.pretrain --depth="$DEPTH" $fp8_flag )
 }
 
 do_midtrain() {
     if stage_done midtrain; then log "midtrain: checkpoint exists, skipping"; return; fi
     local ckpt; ckpt="$(latest_ckpt pretrain)"
-    [ -n "$ckpt" ] || die "no pretrain checkpoint found under $NANOPROOF_HOME/pretrain"
+    [ -n "$ckpt" ] || die "no pretrain checkpoint found under $NANOPROOF_HOME/models/pretrain"
     log "midtrain: Lean GitHub corpus, from $ckpt"
     ( cd "$NP_REPO" && "$PY" -m nanoproof.midtrain --model-path "$ckpt" )
 }
@@ -174,7 +175,7 @@ do_midtrain() {
 do_sft() {
     if stage_done sft; then log "sft: checkpoint exists, skipping"; return; fi
     local ckpt; ckpt="$(latest_ckpt midtrain)"
-    [ -n "$ckpt" ] || die "no midtrain checkpoint found under $NANOPROOF_HOME/midtrain"
+    [ -n "$ckpt" ] || die "no midtrain checkpoint found under $NANOPROOF_HOME/models/midtrain"
     log "sft: LeanTree Mathlib transitions, from $ckpt"
     ( cd "$NP_REPO" && "$PY" -m nanoproof.sft --model-path "$ckpt" )
     log "SFT done. Policy+value checkpoint: $(latest_ckpt sft)"
