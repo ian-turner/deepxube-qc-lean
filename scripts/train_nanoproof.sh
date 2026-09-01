@@ -172,12 +172,19 @@ do_pretrain() {
     elif [ -f "$marker" ]; then
         log "pretrain: complete, skipping (NP_FORCE=1 to redo)"; return
     fi
-    local fp8_flag="" resume_flag="" ckpt
+    local fp8_flag="" resume_flag="" ckpt meta
     [ "$FP8" = 1 ] && fp8_flag="--fp8"
     ckpt="$(latest_ckpt pretrain)"
     if [ -n "$ckpt" ] && [ "$FORCE" != 1 ]; then
-        log "pretrain: resuming from $ckpt"
-        resume_flag="--resume-from=$ckpt"
+        # Only resume a checkpoint of the same depth — a leftover smoke-test
+        # checkpoint would otherwise die with size-mismatch errors on load.
+        meta="$(dirname "$ckpt")/$(basename "$ckpt" | sed 's/^model_/meta_/; s/\.pt$/.json/')"
+        if grep -q "\"depth\": $DEPTH," "$meta" 2>/dev/null; then
+            log "pretrain: resuming from $ckpt"
+            resume_flag="--resume-from=$ckpt"
+        else
+            log "WARNING: ignoring $ckpt (depth != $DEPTH or missing $(basename "$meta")); starting fresh — delete stale runs under $NANOPROOF_HOME/models/pretrain to silence this"
+        fi
     fi
     log "pretrain: depth=$DEPTH on Nemotron-CC-Math (~20B tokens; expect ~3-4 days at depth 26)"
     ( cd "$NP_REPO" && "$PY" -m nanoproof.pretrain --depth="$DEPTH" \
