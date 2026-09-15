@@ -43,6 +43,38 @@ dxlean solve --problems my_bench.jsonl \
     --k 12 --batch 4 --weight 1.0 --itr-max 300 --out results/run1
 ```
 
+### Pre-trained nanoproof policy + value
+
+[nanoproof](https://github.com/Kripner/nanoproof) trains a ~1B policy+value model
+(`scripts/train_nanoproof.sh`); dxlean uses the checkpoint through nanoproof's own
+HTTP inference server, so the model never leaves the GPU cluster:
+
+```bash
+# on the cluster — serve prints the companion dxlean command with the right flags
+scripts/train_nanoproof.sh serve            # port NP_INFER_PORT, default 5001
+```
+
+One request per state yields tactic samples (with logprobs, kept as candidate scores) and
+the value-head prediction, which is *remaining proof depth in tactic steps* — used
+unscaled as `h`. `--value` defaults to `nanoproof` when `--nanoproof` is given; combine
+with `--backbone` / `--endpoint` providers freely. `--np-goals` picks what the policy
+sees (first goal, as in nanoproof's factorized search, or all goals), `--np-value` how
+`h` is assembled (sum of per-goal depths, first goal, or all goals joined).
+
+The model was trained on Lean v4.27.0 + Mathlib states, so against the Mathlib-free
+testproj most of its samples will fail validation. For honest numbers run dxlean **on
+the cluster** against the Mathlib project the training script builds (`leanproj` stage):
+
+```bash
+# build the REPL version that matches nanoproof's Lean pin (reads it from train_nanoproof.sh)
+./scripts/setup_repl.sh nanoproof           # -> vendor/repl-v4.27.0/.lake/build/bin/repl
+
+# run on the same machine as the Lean project (--project must be a local path)
+dxlean solve --problems my_bench.jsonl --nanoproof http://localhost:5001 --backbone "" \
+    --project /work/$USER/nptraining --header "import Mathlib" \
+    --repl-bin vendor/repl-v4.27.0/.lake/build/bin/repl
+```
+
 Problem files are JSONL: `{"name": ..., "statement": "theorem foo ... : ..."}` — the
 statement without a proof; the harness appends `:= by sorry` and searches from there.
 `--header` sets the imports for the session (default `import TestProj`); `--project`

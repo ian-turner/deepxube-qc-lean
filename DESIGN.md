@@ -59,6 +59,15 @@ flow through `ActsEnum.expand` — see tests).
   per line; parses/normalizes/filters), `UnionProvider` (order-preserving dedupe, cap).
 - `values.py` — `ValueProvider` ABC, `GoalCountValue` (deterministic, model-free),
   `LLMJudgeValue` ("steps remaining" integer, cached by state key), `as_heurv` adapter.
+- `nanoproof.py` — the pre-trained nanoproof checkpoint as plugins. Speaks nanoproof's
+  own Flask inference protocol (`POST /generate {"states"} -> tactics+logprobs+value`,
+  503 = busy, retried). One `NanoproofOracle` cache (keyed by prompt string) backs both
+  `NanoproofProvider` (samples as candidates, logprob as score, re-proposal re-samples
+  with a fresh server seed and merges) and `NanoproofValue` (h = predicted remaining
+  proof depth, 1..64 bins, unscaled). deepxube scores children at generation and
+  expands them later, so the value query already stocks the tactic cache: one GPU
+  call per state. Goal text is re-rendered the way leantree (nanoproof's training
+  data) prints it — grouped hypotheses `a b : ℕ` split one per line.
 - `llm.py` — minimal OpenAI-compatible chat client (works with ollama/LM Studio/mlx
   locally and vLLM on the CUDA server) + `FakeChatClient` for deterministic tests.
 - `domain.py` — the `ActsEnum` domain: propose→validate→cache, stats counters.
@@ -98,10 +107,18 @@ flow through `ActsEnum.expand` — see tests).
   use `--backbone` without it to exercise real search; miniF2F/Mathlib benchmarks are
   the next corpus step (per-benchmark toolchain/REPL matching needed).
 
+- nanoproof pins Lean v4.27.0 + Mathlib; testproj is v4.30.0 without Mathlib. Its
+  samples are Mathlib-shaped, so evaluate it against the cluster's Mathlib project
+  with a matching REPL (`scripts/setup_repl.sh nanoproof` reads the pin from the
+  training script, keeping versions in sync). Open question to measure:
+  `--np-value sum|first|all` — the value head was trained on single factorized
+  branches, dxlean states carry the whole goal list.
+
 ## Roadmap
 
-1. **Server config**: vLLM-served open prover pair (e.g. InternLM2.5-StepProver +
-   its critic as a `ValueProvider`; prompt formats matched to the models' training).
+1. **Server config**: nanoproof served via `scripts/train_nanoproof.sh serve` (done);
+   optionally a vLLM-served open prover pair (e.g. InternLM2.5-StepProver + its
+   critic as a `ValueProvider`; prompt formats matched to the models' training).
 2. **Benchmarks**: Mathlib-extracted dev corpus (volume, difficulty spread), then
    miniF2F-test for citable numbers.
 3. **Harness grid**: {best-first reproduction, WA* W-sweep, batch-size sweep, eps

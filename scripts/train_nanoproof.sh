@@ -4,6 +4,7 @@
 # Pipeline: setup -> data -> tokenizer -> pretrain -> midtrain -> sft
 #           (default stops here: this is the fixed policy+value checkpoint dxlean needs)
 # Opt-in:   leanproj / leanserver / rl / eval  (the AlphaProof RL loop + MiniF2F)
+#           serve  (HTTP inference server for dxlean: `dxlean solve --nanoproof URL`)
 #
 # Usage (run inside your conda env, e.g. `conda create -n nanoproof python=3.12`):
 #   conda activate nanoproof
@@ -11,6 +12,8 @@
 #   scripts/train_nanoproof.sh smoke           # tiny pipeline sanity check first!
 #   scripts/train_nanoproof.sh rl              # after sft; starts leanserver itself
 #   scripts/train_nanoproof.sh eval
+#   scripts/train_nanoproof.sh serve           # foreground; then from a laptop:
+#                                              #   ssh -L 5001:localhost:5001 <node>
 #   scripts/train_nanoproof.sh setup data      # run individual stages
 #
 # Knobs (env vars):
@@ -35,6 +38,12 @@
 #   NP_WARMUP_WAIT    seconds to let leanserver import Mathlib before RL/eval (default 900)
 #   NP_PORT           leanserver port                (default 8000)
 #   NP_FORCE          1 = re-run a training stage even if it already has a checkpoint
+#   NP_CKPT           checkpoint for serve (default: newest rl, else newest sft)
+#   NP_INFER_PORT     serve port                       (default 5001)
+#   NP_NUM_SAMPLES    tactics sampled per state         (default 6, nanoproof's own)
+#   NP_FIRST_TOKEN_CAP max samples sharing a first token (default 2; empty = off)
+#   NP_BATCH_TIMEOUT  seconds the server waits to batch requests (default 0.1)
+#   NP_DISABLE_SOLVERS 1 = server drops grind/lia/grobner/aesop samples (default 0)
 #   NP_SAVE_EVERY     pretrain checkpoint interval in steps (default 2000, ~every 4h
 #                     at depth 26; -1 = only at end). Each save is ~5GB (model +
 #                     optimizer) and old saves are not pruned automatically; safe to
@@ -65,6 +74,11 @@ WARMUP_WAIT="${NP_WARMUP_WAIT:-900}"
 PORT="${NP_PORT:-8000}"
 FORCE="${NP_FORCE:-0}"
 SAVE_EVERY="${NP_SAVE_EVERY:-2000}"
+INFER_PORT="${NP_INFER_PORT:-5001}"
+NUM_SAMPLES="${NP_NUM_SAMPLES:-6}"
+FIRST_TOKEN_CAP="${NP_FIRST_TOKEN_CAP-2}"
+BATCH_TIMEOUT="${NP_BATCH_TIMEOUT:-0.1}"
+DISABLE_SOLVERS="${NP_DISABLE_SOLVERS:-0}"
 GPUS="${NP_GPUS:-1}"
 DEVICE_BATCH="${NP_DEVICE_BATCH:-}"
 DB_FLAG=""
@@ -320,6 +334,44 @@ do_eval() {
         --num-simulations 512 )
 }
 
+# ------------------------------------------------------------- serve --------
+
+do_serve() {
+    # nanoproof's own Flask inference server (nanoproof/inference.py), which the
+    # RL loop starts per rank; there is no CLI for it, so start it here. dxlean
+    # speaks its protocol: POST /generate {"states": [...]} -> tactics+logprobs+value.
+    local ckpt="${NP_CKPT:-}"
+    [ -n "$ckpt" ] || ckpt="$(latest_ckpt rl || true)"
+    [ -n "$ckpt" ] || ckpt="$(latest_ckpt sft)"
+    [ -n "$ckpt" ] || die "no checkpoint to serve; set NP_CKPT or run the training stages"
+    log "serve: $ckpt on port $INFER_PORT (num_samples=$NUM_SAMPLES, ctrl-c to stop)"
+    ( cd "$NP_REPO" && exec "$PY" - "$ckpt" "$INFER_PORT" "$NUM_SAMPLES" "$FIRST_TOKEN_CAP" \
+            "$BATCH_TIMEOUT" "$DISABLE_SOLVERS" "$LEAN_VERSION" <<'PYSERVE'
+import signal, socket, sys
+from nanoproof.inference import BlockingTacticModel, TacticModel, start_inference_server
+
+ckpt, port, n, cap, timeout, disable, lean_ver = sys.argv[1:8]
+inner = TacticModel.create(
+    num_samples=int(n), model_path=ckpt,
+    first_token_occurrences_cap=int(cap) if cap else None,
+    disable_solvers=disable == "1")
+model = BlockingTacticModel(inner_model=inner, timeout_seconds=float(timeout),
+                            max_gen_samples=None, max_batch_prompt_tokens=None)
+start_inference_server(model, int(port))
+host = socket.gethostname()
+print(f"[serve] ready on http://{host}:{port}/generate (health: /health)", flush=True)
+print(f"[serve] tunnel:  ssh -L {port}:localhost:{port} {host}", flush=True)
+print(f"[serve] setup REPL (once):  ./scripts/setup_repl.sh nanoproof"
+      f"  -> vendor/repl-{lean_ver}/.lake/build/bin/repl", flush=True)
+print(f"[serve] dxlean:  dxlean solve --problems BENCH.jsonl"
+      f" --nanoproof http://localhost:{port} --backbone ''"
+      f" --project LEAN_PROJECT --header 'import Mathlib'"
+      f" --repl-bin vendor/repl-{lean_ver}/.lake/build/bin/repl", flush=True)
+signal.pause()
+PYSERVE
+    )
+}
+
 do_stop() {
     if [ -f "$SERVER_PID_FILE" ]; then
         kill "$(cat "$SERVER_PID_FILE")" 2>/dev/null || true
@@ -346,6 +398,7 @@ for stage in "${STAGES[@]}"; do
         leanserver) do_leanserver ;;
         rl)         do_rl ;;
         eval)       do_eval ;;
+        serve)      do_serve ;;
         stop)       do_stop ;;
         all)        do_setup; do_data; do_tokenizer; do_pretrain; do_midtrain; do_sft; do_rl ;;
         *)          die "unknown stage: $stage" ;;

@@ -4,6 +4,10 @@ Examples:
   # backbone tactics only, deterministic heuristic (no LLM anywhere):
   dxlean solve --problems problems/dev.jsonl --no-llm
 
+  # pre-trained nanoproof policy+value served from the GPU cluster
+  # (scripts/train_nanoproof.sh serve, then ssh -L 5001:localhost:5001 <node>):
+  dxlean solve --problems problems/dev.jsonl --nanoproof http://localhost:5001 --backbone ""
+
   # local model via any OpenAI-compatible server (ollama, LM Studio, mlx, vllm):
   dxlean solve --problems problems/dev.jsonl \
       --endpoint http://localhost:11434/v1 --model qwen2.5-coder:7b --value judge
@@ -25,6 +29,8 @@ from typing import List
 
 from .domain import LeanDomain
 from .llm import ChatClient
+from .nanoproof import (GOAL_MODES, VALUE_MODES, NanoproofClient, NanoproofOracle,
+                        NanoproofProvider, NanoproofValue)
 from .providers import BackboneProvider, LLMSampler, UnionProvider
 from .repl import REPLManager
 from .solve import solve
@@ -56,7 +62,17 @@ def _add_common_args(s: argparse.ArgumentParser) -> None:
     s.add_argument("--no-llm", action="store_true", help="backbone tactics only")
     s.add_argument("--backbone", default=None,
                    help="comma-separated backbone tactic menu ('' disables backbone; default: built-in menu)")
-    s.add_argument("--value", choices=["goalcount", "judge"], default="goalcount")
+    s.add_argument("--nanoproof", default=None, metavar="URL",
+                   help="nanoproof inference server, e.g. http://localhost:5001 "
+                        "(scripts/train_nanoproof.sh serve; ssh -L to reach it from a laptop)")
+    s.add_argument("--np-goals", choices=GOAL_MODES, default="first",
+                   help="goals shown to the nanoproof policy: the first goal (as in nanoproof's "
+                        "own factorized search) or all goals joined")
+    s.add_argument("--np-value", choices=VALUE_MODES, default="sum",
+                   help="nanoproof h: sum of per-goal depth predictions, first goal only, or all goals joined")
+    s.add_argument("--np-chunk", type=int, default=32, help="states per nanoproof HTTP request")
+    s.add_argument("--value", choices=["goalcount", "judge", "nanoproof"], default=None,
+                   help="heuristic (default: nanoproof when --nanoproof is given, else goalcount)")
     s.add_argument("--k", type=int, default=8, help="LLM tactic samples per state")
     s.add_argument("--temperature", type=float, default=0.7)
     s.add_argument("--cap", type=int, default=24, help="max candidates validated per state")
@@ -72,8 +88,8 @@ def _add_common_args(s: argparse.ArgumentParser) -> None:
 def _build(p: argparse.ArgumentParser, args: argparse.Namespace):
     """Construct (repl, provider, value) from parsed common args."""
     use_llm = not args.no_llm and args.endpoint is not None
-    if not args.no_llm and args.endpoint is None:
-        print("[dxlean] no --endpoint given: running backbone-only (pass --no-llm to silence)")
+    if not args.no_llm and args.endpoint is None and not args.nanoproof:
+        print("[dxlean] no --endpoint/--nanoproof given: running backbone-only (pass --no-llm to silence)")
     client = None
     if use_llm:
         if args.model is None:
@@ -85,18 +101,33 @@ def _build(p: argparse.ArgumentParser, args: argparse.Namespace):
         providers.append(BackboneProvider())
     elif args.backbone.strip():
         providers.append(BackboneProvider([t.strip() for t in args.backbone.split(",") if t.strip()]))
+    oracle = None
+    if args.nanoproof:
+        oracle = NanoproofOracle(NanoproofClient(args.nanoproof, chunk=args.np_chunk),
+                                 goal_mode=args.np_goals, value_mode=args.np_value)
+        try:
+            oracle.client.health()
+        except Exception as e:
+            p.error(f"nanoproof server {args.nanoproof} not reachable: {e}")
+        providers.append(NanoproofProvider(oracle))
     if client is not None:
         providers.append(LLMSampler(client, k=args.k, temperature=args.temperature))
     if not providers:
-        p.error("no action providers: give --backbone or an --endpoint")
+        p.error("no action providers: give --backbone, --nanoproof, or an --endpoint")
     provider = UnionProvider(providers, cap=args.cap)
 
-    if args.value == "judge":
+    value_choice = args.value or ("nanoproof" if oracle is not None else "goalcount")
+    if value_choice == "judge":
         if client is None:
             p.error("--value judge requires --endpoint/--model")
         value = LLMJudgeValue(client)
+    elif value_choice == "nanoproof":
+        if oracle is None:
+            p.error("--value nanoproof requires --nanoproof URL")
+        value = NanoproofValue(oracle)
     else:
         value = GoalCountValue()
+    args.oracle = oracle
 
     repl = REPLManager(args.project, args.repl_bin, header=args.header,
                        tactic_timeout=args.tactic_timeout)
@@ -115,6 +146,9 @@ def _cmd_solve(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
                         verbose=not args.quiet)
     finally:
         repl.stop()
+    if args.oracle is not None and not args.quiet:
+        print(f"[dxlean] nanoproof: {args.oracle.stats} | http requests: {args.oracle.client.n_requests}, "
+              f"busy retries: {args.oracle.client.n_busy}")
 
     if args.out:
         os.makedirs(os.path.join(args.out, "proofs"), exist_ok=True)
