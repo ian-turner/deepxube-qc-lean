@@ -1,26 +1,5 @@
-from dxlean.providers import (BackboneProvider, Candidate, ProposalRequest,
-                              UnionProvider, parse_tactic_lines)
-from dxlean.states import LeanState, TheoremSpec
-
-
-def test_parse_tactic_lines_strips_and_filters():
-    text = """1. simp
-- `omega`
-```
-constructor
-```
--- a comment
-exact sorry
-apply Nat.le_of_lt
-simp
-"""
-    got = parse_tactic_lines(text, 8)
-    assert got == ["simp", "omega", "constructor", "apply Nat.le_of_lt"]
-
-
-def test_parse_tactic_lines_caps():
-    text = "\n".join(f"tac{i}" for i in range(20))
-    assert len(parse_tactic_lines(text, 5)) == 5
+from dxlean.providers import BackboneProvider, Candidate, ProposalRequest, UnionProvider
+from dxlean.states import LeanState
 
 
 class _Fixed:
@@ -32,8 +11,7 @@ class _Fixed:
 
 
 def _req():
-    thm = TheoremSpec("t", "theorem t : True")
-    return ProposalRequest(LeanState("t", ("⊢ True",), ()), thm)
+    return ProposalRequest(LeanState("t", ("⊢ True",), ()))
 
 
 def test_union_dedupes_and_caps():
@@ -43,6 +21,7 @@ def test_union_dedupes_and_caps():
     assert cands[1].provenance == "a"  # first provider wins the duplicate
 
 
-def test_backbone_skips_nothing_by_default():
+def test_backbone_menu():
     (cands,) = BackboneProvider(["rfl", "simp"]).propose([_req()])
     assert [c.tactic for c in cands] == ["rfl", "simp"]
+    assert len(BackboneProvider().propose([_req()])[0]) > 2  # built-in menu

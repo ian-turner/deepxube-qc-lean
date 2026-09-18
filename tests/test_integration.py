@@ -2,6 +2,7 @@
 (scripts/setup_repl.sh). Skipped automatically when the REPL binary is absent.
 """
 import os
+from typing import Dict, List
 
 import pytest
 
@@ -11,12 +12,31 @@ PROJECT = os.path.join(ROOT, "lean", "testproj")
 
 pytestmark = pytest.mark.skipif(not os.path.exists(REPL_BIN), reason="REPL not built")
 
-from dxlean.domain import LeanDomain          # noqa: E402
-from dxlean.providers import BackboneProvider  # noqa: E402
-from dxlean.repl import REPLManager            # noqa: E402
-from dxlean.solve import solve                 # noqa: E402
-from dxlean.states import TheoremSpec          # noqa: E402
-from dxlean.values import GoalCountValue       # noqa: E402
+from dxlean.domain import LeanDomain                                         # noqa: E402
+from dxlean.providers import ActionProvider, BackboneProvider, Candidate     # noqa: E402
+from dxlean.repl import REPLManager                                          # noqa: E402
+from dxlean.solve import solve                                               # noqa: E402
+from dxlean.states import TheoremSpec                                        # noqa: E402
+from dxlean.values import GoalCountValue                                     # noqa: E402
+
+
+class ScriptedProvider(ActionProvider):
+    """Stands in for a tactic model: answers by a substring of the first goal.
+    `retry` is returned instead once any tactic has failed on the state."""
+
+    def __init__(self, table: Dict[str, List[str]], retry: List[str] = ()):
+        self.table, self.retry, self.n_calls = table, list(retry), 0
+
+    def propose(self, reqs):
+        out = []
+        for r in reqs:
+            self.n_calls += 1
+            if r.failed and self.retry:
+                tactics = self.retry
+            else:
+                tactics = next((v for k, v in self.table.items() if k in r.state.goals[0]), ["rfl"])
+            out.append([Candidate(t, "scripted") for t in tactics])
+        return out
 
 
 @pytest.fixture(scope="module")
@@ -41,10 +61,33 @@ def test_apply_tactic_solves_and_errors(repl):
     banned = repl.apply_tactic(root, "sorry")
     assert banned.status == "error"
 
-    ok, _ = repl.check_full_proof(thm, ("simp",))
-    assert ok
+    ok, code = repl.check_full_proof(thm, ("simp",))
+    assert ok and code == "theorem tst_add_zero (n : Nat) : n + 0 = n := by\n  simp\n"
     ok, _ = repl.check_full_proof(thm, ("nonsense_tac",))
     assert not ok
+
+
+def test_timeout_restarts_and_replays(repl):
+    """A timed-out tactic kills the REPL; later states are rebuilt by replaying
+    their tactic prefix, so the search continues on the same states."""
+    thm = TheoremSpec("tst_timeout", "theorem tst_timeout (a b : Prop) (h : a ∧ b) : b ∧ a")
+    root = repl.init_theorem(thm)
+    mid = repl.apply_tactic(root, "constructor").state
+    assert mid is not None and len(mid.goals) == 2
+
+    repl.tactic_timeout, saved = 0.05, repl.tactic_timeout
+    try:
+        res = repl.apply_tactic(mid, "sleep 300")  # core tactic: sleeps 300ms, goals unchanged
+    finally:
+        repl.tactic_timeout = saved
+    assert res.status == "timeout"
+    n_restarts = repl.n_restarts
+    assert n_restarts >= 1
+
+    # `mid` lost its proofState id with the process; it is replayed transparently
+    res = repl.apply_tactic(mid, "exact h.2")
+    assert res.status == "ok" and res.state is not None and len(res.state.goals) == 1
+    assert repl.n_restarts == n_restarts
 
 
 def test_expand_handles_empty_action_lists(repl):
@@ -55,7 +98,7 @@ def test_expand_handles_empty_action_lists(repl):
     solved = repl.apply_tactic(root, "rfl").state
     assert solved is not None and solved.solved
 
-    domain = LeanDomain(repl, BackboneProvider(["rfl"]), {thm.name: thm})
+    domain = LeanDomain(repl, BackboneProvider(["rfl"]))
     children, actions, tcs = domain.expand([solved])
     assert children == [[]] and actions == [[]] and tcs == [[]]
 
@@ -65,72 +108,48 @@ def test_solve_backbone_only(repl):
         TheoremSpec("tst_two", "theorem tst_two : 2 + 2 = 4"),
         TheoremSpec("tst_imp", "theorem tst_imp (p : Prop) : p → p"),
     ]
-    domain = LeanDomain(repl, BackboneProvider(), {t.name: t for t in theorems})
+    domain = LeanDomain(repl, BackboneProvider())
     results = solve(theorems, repl, domain, GoalCountValue(), itr_max=25)
     assert all(r.solved and r.verified for r in results)
     two = next(r for r in results if r.name == "tst_two")
-    assert len(two.tactics) == 1
+    assert len(two.tactics) == 1 and two.proof.startswith(theorems[0].statement)
 
 
-def test_solve_multistep_with_fake_llm(repl):
-    """Multi-step proof driven by model-proposed tactics: the fake LLM plays a
-    tactic model proposing `apply`/`exact` steps the backbone menu cannot make.
-    Exercises the full propose -> validate -> search -> certify loop."""
-    from dxlean.llm import FakeChatClient
-    from dxlean.providers import LLMSampler, UnionProvider
-
+def test_solve_multistep_with_scripted_model(repl):
+    """Multi-step proof driven by model-proposed tactics that the backbone menu
+    cannot make. Exercises the full propose -> validate -> search -> certify loop."""
     thm = TheoremSpec("tst_trans", "theorem tst_trans (p q r s : Prop) "
                       "(h1 : p → q) (h2 : q → r) (h3 : r → s) : p → s")
-
-    def respond(system: str, user: str) -> str:
-        if "⊢ p → s" in user:
-            return "intro hp\nconstructor"
-        if "⊢ s" in user:
-            return "apply h3\napply h1"
-        if "⊢ r" in user:
-            return "apply h2\nrfl"
-        if "⊢ q" in user:
-            return "apply h1\nassumption"
-        if "⊢ p" in user:
-            return "exact hp\nomega"
-        return "rfl"
-
-    client = FakeChatClient(respond)
-    provider = UnionProvider([LLMSampler(client, k=4)], cap=8)
-    domain = LeanDomain(repl, provider, {thm.name: thm})
+    provider = ScriptedProvider({
+        "⊢ p → s": ["intro hp", "constructor"],
+        "⊢ s": ["apply h3", "apply h1"],
+        "⊢ r": ["apply h2", "rfl"],
+        "⊢ q": ["apply h1", "assumption"],
+        "⊢ p": ["exact hp", "omega"],
+    })
+    domain = LeanDomain(repl, provider)
     (result,) = solve([thm], repl, domain, GoalCountValue(), itr_max=30)
 
     assert result.solved and result.verified
     assert result.tactics == ["intro hp", "apply h3", "apply h2", "apply h1", "exact hp"]
-    assert client.n_calls >= 5
+    assert provider.n_calls >= 5
 
 
 def test_resample_recovers_from_bad_round(repl):
-    """One bad LLM sample round must not permanently dead-end a state: the
-    domain re-proposes with the failed tactics fed back to the sampler (found
-    live: qwen2.5-coder proposed only junk for and_swap's root and the search
-    died at iteration 0, frontier exhausted)."""
-    from dxlean.llm import FakeChatClient
-    from dxlean.providers import LLMSampler, UnionProvider
-
+    """One bad sample round must not permanently dead-end a state: the domain
+    re-proposes with the failed tactics fed back to the provider."""
     thm = TheoremSpec("tst_resample", "theorem tst_resample (a b : Prop) (h : a ∧ b) : b ∧ a")
+    bad, good = ["exact h.1", "exact h.2"], ["exact ⟨h.2, h.1⟩"]
 
-    def respond(system: str, user: str) -> str:
-        if "already FAILED" in user:
-            return "exact ⟨h.2, h.1⟩"
-        return "exact h.1\nexact h.2"
-
-    provider = UnionProvider([LLMSampler(FakeChatClient(respond), k=4)], cap=8)
-    domain = LeanDomain(repl, provider, {thm.name: thm})
+    domain = LeanDomain(repl, ScriptedProvider({"⊢ b ∧ a": bad}, retry=good))
     root = repl.init_theorem(thm)
     (acts,) = domain.get_state_actions([root])
-    assert [a.tactic for a in acts] == ["exact ⟨h.2, h.1⟩"]
+    assert [a.tactic for a in acts] == good
     assert domain.stats["resamples"] == 1
-    assert domain.failed_tactics(root) == {"exact h.1", "exact h.2"}
+    assert domain.failed_tactics(root) == set(bad)
 
     # with resampling disabled, the same bad round is a permanent dead end
-    provider0 = UnionProvider([LLMSampler(FakeChatClient(respond), k=4)], cap=8)
-    domain0 = LeanDomain(repl, provider0, {thm.name: thm}, max_resamples=0)
+    domain0 = LeanDomain(repl, ScriptedProvider({"⊢ b ∧ a": bad}, retry=good), max_resamples=0)
     (acts0,) = domain0.get_state_actions([repl.init_theorem(thm)])
     assert acts0 == [] and domain0.stats["resamples"] == 0
 
@@ -138,7 +157,7 @@ def test_resample_recovers_from_bad_round(repl):
 def test_self_reference_rejected(repl):
     """`theorem X := by sorry` puts a sorry-backed `X` in the search env; using
     it is a circular proof that certification rejects — so the tactic gate must
-    refuse it up front (found live: llama3 proposed `apply and_swap`)."""
+    refuse it up front (found live: a model proposed `apply and_swap`)."""
     thm = TheoremSpec("tst_selfref", "theorem tst_selfref (a b : Prop) (h : a ∧ b) : b ∧ a")
     root = repl.init_theorem(thm)
 

@@ -60,8 +60,7 @@ def test_traced_search_narrates_and_prints_tree(capsys, tmp_path):
     repl.start()
     try:
         thm = TheoremSpec("tst_imp_viz", "theorem tst_imp_viz (p : Prop) : p → p")
-        domain = LeanDomain(repl, BackboneProvider(["intro h", "assumption", "constructor"]),
-                            {thm.name: thm})
+        domain = LeanDomain(repl, BackboneProvider(["intro h", "assumption", "constructor"]))
         fig_path = str(tmp_path / "tree.png")
         solved, tactics = traced_search(thm, repl, domain, GoalCountValue(), itr_max=20,
                                         fig_path=fig_path)

@@ -1,7 +1,7 @@
 [project]
 name = "dxlean"
 version = "0.1.0"
-description = "Generic Lean 4 theorem-proving environment for deepxube: LLM-sampled tactics as actions, pre-trained value guidance, batch weighted A* search"
+description = "Lean 4 theorem proving for deepxube: nanoproof policy+value as tactic sampler and heuristic, batch weighted A* search"
 requires-python = ">=3.11"
 dependencies = [
     "deepxube @ git+https://github.com/forestagostinelli/deepxube@c2e02739e7e23d97eb96a7e5b12ef19aea88ac48",

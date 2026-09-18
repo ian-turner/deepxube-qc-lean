@@ -215,7 +215,8 @@ class NanoproofOracle:
 
 class NanoproofProvider(ActionProvider):
     """Sampled tactics, best logprob first. A request whose known-failed set
-    already covers every cached sample is a re-proposal: re-sample and merge."""
+    already covers every cached sample (or whose sample came back empty) is
+    re-sampled with a fresh server seed and merged."""
 
     def __init__(self, oracle: NanoproofOracle):
         self.oracle = oracle
@@ -224,7 +225,7 @@ class NanoproofProvider(ActionProvider):
         prompts = [self.oracle.tactic_prompt(r.state) for r in reqs]
         results = self.oracle.query(prompts)
         stale = [p for p, r, res in zip(prompts, reqs, results)
-                 if not res.error and r.failed and all(t in r.failed for t in res.tactics)]
+                 if not res.error and all(t in r.failed for t in res.tactics)]
         if stale:
             self.oracle.refresh(stale)
             results = self.oracle.query(prompts)
@@ -246,14 +247,6 @@ class NanoproofValue(ValueProvider):
 
     def estimate(self, states: List[LeanState], goals: List[LeanGoal]) -> List[float]:
         per_state = [[] if s.solved else self.oracle.value_prompts(s) for s in states]
-        flat = [p for ps in per_state for p in ps]
-        results = iter(self.oracle.query(flat))
-        out: List[float] = []
-        for s, ps in zip(states, per_state):
-            if s.solved:
-                out.append(0.0)
-                continue
-            vals = [r.value if r.value is not None else self.default
-                    for r in (next(results) for _ in ps)]
-            out.append(float(sum(vals)) if vals else self.default)
-        return out
+        results = iter(self.oracle.query([p for ps in per_state for p in ps]))
+        return [sum(self.default if r.value is None else r.value for r in (next(results) for _ in ps))
+                for ps in per_state]  # solved states have no prompts -> 0.0

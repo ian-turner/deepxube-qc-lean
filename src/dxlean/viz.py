@@ -9,7 +9,7 @@ Three views, all built on the REPL's pretty-printed goal text:
 - `traced_search`: run the real search on one theorem, narrating every
   iteration (what was popped, its f = W·g + h, which candidates validated),
   then print the search tree (deepxube keeps it in `Node.edge_dict`) with the
-  solution path marked.
+  solution path marked, optionally also as a matplotlib figure.
 """
 from __future__ import annotations
 
@@ -82,15 +82,15 @@ INTERACTIVE_HELP = """commands:
   :q         quit"""
 
 
-def interactive(repl: REPLManager, provider: ActionProvider, theorem: TheoremSpec,
-                value_provider: Optional[ValueProvider] = None) -> None:
+def interactive(repl: REPLManager, provider: ActionProvider, value_provider: ValueProvider,
+                theorem: TheoremSpec) -> None:
     stack: List[LeanState] = [repl.init_theorem(theorem)]
     goal = LeanGoal(theorem)
     print(f"\n=== {theorem.name} ===\n{theorem.statement}\n\n{INTERACTIVE_HELP}\n")
 
     def show(state: LeanState) -> None:
         print(format_goals(state))
-        if value_provider is not None and not state.solved:
+        if not state.solved:
             (h,) = value_provider.estimate([state], [goal])
             print(f"  [h = {h:.1f}]")
 
@@ -119,47 +119,57 @@ def interactive(repl: REPLManager, provider: ActionProvider, theorem: TheoremSpe
             if state.solved:
                 print("  already solved")
                 continue
-            (cands,) = provider.propose([ProposalRequest(state, theorem, ())])
+            (cands,) = provider.propose([ProposalRequest(state)])
             if not cands:
                 print("  providers proposed nothing")
                 continue
             for c in cands:
                 res = repl.apply_tactic(state, c.tactic)
                 mark = {"ok": "✓", "solved": "★"}.get(res.status, "✗")
-                note = "" if res.status in ("ok", "solved") else f"  ({res.status}: {res.message[:60]})"
+                note = "" if res.state is not None else f"  ({res.status}: {res.message[:60]})"
                 print(f"  {mark} [{c.provenance}] {c.tactic}{note}")
         elif line.startswith(":"):
             print(INTERACTIVE_HELP)
         else:
             res = repl.apply_tactic(state, line)
-            if res.status in ("ok", "solved"):
-                assert res.state is not None
-                stack.append(res.state)
-                show(res.state)
-                if res.state.solved:
-                    ok, _ = repl.check_full_proof(theorem, res.state.tactics)
-                    print(f"\n  proof: {' ; '.join(res.state.tactics)}")
-                    print(f"  certification: {'PASSED' if ok else 'FAILED'}")
-            else:
+            if res.state is None:
                 print(f"  ✗ {res.status}: {res.message[:200]}")
+                continue
+            stack.append(res.state)
+            show(res.state)
+            if res.state.solved:
+                ok, _ = repl.check_full_proof(theorem, res.state.tactics)
+                print(f"\n  proof: {' ; '.join(res.state.tactics)}")
+                print(f"  certification: {'PASSED' if ok else 'FAILED'}")
 
 
-# -- search-tree figure ------------------------------------------------------
+# -- search tree -------------------------------------------------------------
+
+_STATUS_MARK = {"solved": "✓", "dead": "✗", "unexpanded": "·", "open": " "}
+
 
 def _node_status(state: LeanState, domain: LeanDomain) -> str:
     if state.solved:
         return "solved"
-    if domain.expanded(state):
-        return "dead" if not domain.valid_actions(state) else "open"
-    return "unexpanded"
+    if not domain.expanded(state):
+        return "unexpanded"
+    return "dead" if not domain.valid_actions(state) else "open"
 
 
-def render_search_tree(root: Node, domain: LeanDomain, on_path: Set[int], fig: Figure,
-                       title: str = "", max_nodes: int = 400) -> None:
-    """Draw the search tree on a matplotlib Figure: one row per node in the same
-    DFS order as the terminal view, L-shaped connectors, solution path in gold,
-    solved states green, dead ends red, unexpanded frontier gray."""
-    rows: List[Tuple[Node, int]] = []  # (node, depth), row index = list position
+def _node_label(node: Node, domain: LeanDomain, on_path: Set[int], width: int) -> Tuple[str, str]:
+    """(status, one-line text) for a tree node."""
+    state: LeanState = node.state  # type: ignore[assignment]
+    status = _node_status(state, domain)
+    star = "★ " if id(node) in on_path else ""
+    label = "(root)" if node.parent is None else str(node.parent_action)
+    text = (f"{star}{label}  {_STATUS_MARK[status]} g={node.path_cost:.0f} h={node.heuristic:.1f}"
+            f"  {goal_oneliner(state, width)}")
+    return status, text
+
+
+def _tree_rows(root: Node, max_nodes: int) -> List[Tuple[Node, int]]:
+    """(node, depth) in DFS order, truncated at max_nodes."""
+    rows: List[Tuple[Node, int]] = []
 
     def walk(node: Node, depth: int) -> None:
         if len(rows) >= max_nodes:
@@ -169,7 +179,31 @@ def render_search_tree(root: Node, domain: LeanDomain, on_path: Set[int], fig: F
             walk(child, depth + 1)
 
     walk(root, 0)
+    return rows
 
+
+def _print_tree(node: Node, domain: LeanDomain, on_path: Set[int], prefix: str,
+                is_last: bool, budget: List[int]) -> None:
+    if budget[0] <= 0:
+        return
+    budget[0] -= 1
+    connector = "" if node.parent is None else prefix + ("└─ " if is_last else "├─ ")
+    _, text = _node_label(node, domain, on_path, width=64)
+    print(connector + text)
+    children = [child for _, child in node.edge_dict.values()]
+    child_prefix = "" if node.parent is None else prefix + ("   " if is_last else "│  ")
+    for i, child in enumerate(children):
+        _print_tree(child, domain, on_path, child_prefix, i == len(children) - 1, budget)
+    if budget[0] == 0:
+        print(f"{child_prefix}… (tree truncated)")
+        budget[0] = -1
+
+
+def render_search_tree(rows: List[Tuple[Node, int]], domain: LeanDomain, on_path: Set[int],
+                       fig: Figure, title: str = "") -> None:
+    """Draw the search tree on a matplotlib Figure: one row per node in DFS
+    order, L-shaped connectors, solution path in gold, solved states green,
+    dead ends red, unexpanded frontier gray."""
     fig.clf()
     fig.set_facecolor("white")
     ax = fig.add_subplot(111)
@@ -177,29 +211,22 @@ def render_search_tree(root: Node, domain: LeanDomain, on_path: Set[int], fig: F
     if title:
         ax.set_title(title, fontsize=10, family="monospace", loc="left")
 
-    pos = {id(node): (depth * 1.0, -i * 1.0) for i, (node, depth) in enumerate(rows)}
+    pos = {id(node): (float(depth), -float(i)) for i, (node, depth) in enumerate(rows)}
     fills = {"solved": "#c8e6c9", "dead": "#ffcdd2", "unexpanded": "#eeeeee", "open": "white"}
-    for node, depth in rows:
-        state: LeanState = node.state  # type: ignore[assignment]
+    for node, _ in rows:
         x, y = pos[id(node)]
         if node.parent is not None and id(node.parent) in pos:
             px, py = pos[id(node.parent)]
             ax.plot([px + 0.08, px + 0.08, x - 0.06], [py - 0.28, y, y],
                     color="#aaaaaa", linewidth=0.9, zorder=1)
-        status = _node_status(state, domain)
+        status, text = _node_label(node, domain, on_path, width=46)
         star = id(node) in on_path
-        label = "(root)" if node.parent is None else str(node.parent_action)
-        prov = "" if node.parent is None else f" [{getattr(node.parent_action, 'provenance', '?')}]"
-        mark = {"solved": " ✓", "dead": " ✗", "unexpanded": " ·", "open": ""}[status]
-        text = (f"{'★ ' if star else ''}{label}{prov}{mark}  "
-                f"g={node.path_cost:.0f} h={node.heuristic:.1f}  {goal_oneliner(state, width=46)}")
         ax.text(x, y, text, fontsize=8, family="monospace", va="center", ha="left", zorder=2,
                 bbox=dict(boxstyle="round,pad=0.25", facecolor=fills[status],
                           edgecolor="#b8860b" if star else "#999999",
                           linewidth=1.6 if star else 0.7))
 
-    depth_max = max(d for _, d in rows)
-    ax.set_xlim(-0.4, depth_max + 9.0)
+    ax.set_xlim(-0.4, max(d for _, d in rows) + 9.0)
     ax.set_ylim(-len(rows) + 0.2, 1.2)
 
 
@@ -215,8 +242,7 @@ def traced_search(theorem: TheoremSpec, repl: REPLManager, domain: LeanDomain,
         batch_size=batch_size, weight=weight, eps=eps)
 
     root = repl.init_theorem(theorem)
-    goal = LeanGoal(theorem)
-    (instance,) = search.make_instances([root], [goal], inst_infos=[theorem.name])
+    (instance,) = search.make_instances([root], [LeanGoal(theorem)], inst_infos=[theorem.name])
     search.add_instances([instance])
 
     print(f"\n=== search: {theorem.name}  (W={weight}, B={batch_size}, itr_max={itr_max}) ===")
@@ -237,8 +263,7 @@ def traced_search(theorem: TheoremSpec, repl: REPLManager, domain: LeanDomain,
             if state.solved:
                 print("  → solved state popped; goal recorded")
             elif not acts:
-                n_failed = len(domain.failed_tactics(state))
-                print(f"  → dead end: 0 valid tactics ({n_failed} candidates failed)")
+                print(f"  → dead end: 0 valid tactics ({len(domain.failed_tactics(state))} candidates failed)")
             else:
                 shown = ", ".join(f"{a.tactic} [{a.provenance}]" for a in acts[:8])
                 more = f" (+{len(acts) - 8} more)" if len(acts) > 8 else ""
@@ -247,13 +272,13 @@ def traced_search(theorem: TheoremSpec, repl: REPLManager, domain: LeanDomain,
 
     solved = instance.has_soln()
     tactics: List[str] = []
-    print(f"\n=== search tree ===")
     on_path: Set[int] = set()
     if solved:
         node = instance.goal_node
         while node is not None:
             on_path.add(id(node))
             node = node.parent
+    print("\n=== search tree ===")
     _print_tree(instance.root_node, domain, on_path, "", True, [max_tree_lines])
 
     if solved:
@@ -270,48 +295,10 @@ def traced_search(theorem: TheoremSpec, repl: REPLManager, domain: LeanDomain,
 
     if fig_path is not None:
         outcome = f"SOLVED: {' ; '.join(tactics)}" if solved else "UNSOLVED"
-        n_rows = _count_nodes(instance.root_node)
-        fig = Figure(figsize=(13, max(3.0, 0.42 * n_rows + 1.5)))
-        render_search_tree(instance.root_node, domain, on_path, fig,
-                           title=f"{theorem.statement}\n{outcome}   "
-                                 f"(W={weight}, {instance.itr} iterations)")
+        rows = _tree_rows(instance.root_node, max_nodes=400)
+        fig = Figure(figsize=(13, max(3.0, 0.42 * len(rows) + 1.5)))
+        render_search_tree(rows, domain, on_path, fig,
+                           title=f"{theorem.statement}\n{outcome}   (W={weight}, {instance.itr} iterations)")
         fig.savefig(fig_path, dpi=150, bbox_inches="tight")
         print(f"[dxlean] wrote search tree figure: {fig_path}")
     return solved, tactics
-
-
-def _count_nodes(root: Node) -> int:
-    n = 1
-    for _, child in root.edge_dict.values():
-        n += _count_nodes(child)
-    return n
-
-
-def _print_tree(node: Node, domain: LeanDomain, on_path: Set[int], prefix: str,
-                is_last: bool, budget: List[int]) -> None:
-    if budget[0] <= 0:
-        return
-    budget[0] -= 1
-    state: LeanState = node.state  # type: ignore[assignment]
-    if node.parent is None:
-        connector, label = "", "(root)"
-    else:
-        connector = prefix + ("└─ " if is_last else "├─ ")
-        label = str(node.parent_action)
-    star = "★ " if id(node) in on_path else ""
-    if state.solved:
-        status = "✓"
-    elif domain.expanded(state) and not domain.valid_actions(state):
-        status = "✗"
-    elif not domain.expanded(state):
-        status = "·"
-    else:
-        status = " "
-    print(f"{connector}{star}{label}  {status} g={node.path_cost:.0f} h={node.heuristic:.1f}  {goal_oneliner(state)}")
-    children = [child for _, child in node.edge_dict.values()]
-    child_prefix = "" if node.parent is None else prefix + ("   " if is_last else "│  ")
-    for i, child in enumerate(children):
-        _print_tree(child, domain, on_path, child_prefix, i == len(children) - 1, budget)
-    if budget[0] == 0:
-        print(f"{child_prefix}… (tree truncated)")
-        budget[0] = -1

@@ -60,12 +60,15 @@ class LeanREPL:
             bufsize=1,
         )
         self._lines = queue.Queue()
-        threading.Thread(target=self._reader, args=(self.proc.stdout,), daemon=True).start()
+        # the reader is bound to *its* queue: a killed process's late EOF must
+        # not land in the queue of its replacement (that desyncs every later reply)
+        threading.Thread(target=self._reader, args=(self.proc.stdout, self._lines), daemon=True).start()
 
-    def _reader(self, stdout) -> None:
+    @staticmethod
+    def _reader(stdout, lines: "queue.Queue[Optional[str]]") -> None:
         for line in stdout:
-            self._lines.put(line.rstrip("\n"))
-        self._lines.put(None)  # EOF marker
+            lines.put(line.rstrip("\n"))
+        lines.put(None)  # EOF marker
 
     def stop(self) -> None:
         if self.proc is not None:
@@ -140,7 +143,8 @@ class REPLManager:
         self._root_ps.clear()
         self._ps_ids.clear()
         if self.header:
-            resp = self._request({"cmd": self.header}, self.cmd_timeout)
+            # bypass _request: a header failure must not trigger a restart loop
+            resp = self.repl.request({"cmd": self.header}, self.cmd_timeout)
             errs = _error_messages(resp)
             if errs or "env" not in resp:
                 raise REPLError(f"header failed: {errs or resp}")
@@ -155,8 +159,19 @@ class REPLManager:
         self.start()
 
     def _request(self, obj: dict, timeout: float) -> dict:
+        """One request; on timeout or a dead process the REPL is restarted
+        before the error propagates. A timed-out process is still computing
+        and would otherwise answer the *next* request with the stale response."""
         self.n_requests += 1
-        return self.repl.request(obj, timeout)
+        try:
+            return self.repl.request(obj, timeout)
+        except REPLTimeout:
+            self._restart()
+            raise
+        except REPLError:
+            if not self.repl.alive:
+                self._restart()
+            raise
 
     # -- theorems and states -------------------------------------------------
 
@@ -168,11 +183,14 @@ class REPLManager:
         self._ps_ids[state.key] = ps_id
         return state
 
-    def _elab_root(self, thm: TheoremSpec) -> Tuple[int, str]:
-        cmd: dict = {"cmd": f"{thm.statement} := by sorry"}
+    def _cmd(self, code: str) -> dict:
+        cmd: dict = {"cmd": code}
         if self.header_env is not None:
             cmd["env"] = self.header_env
-        resp = self._request(cmd, self.cmd_timeout)
+        return cmd
+
+    def _elab_root(self, thm: TheoremSpec) -> Tuple[int, str]:
+        resp = self._request(self._cmd(f"{thm.statement} := by sorry"), self.cmd_timeout)
         errs = _error_messages(resp)
         if errs:
             raise REPLError(f"theorem {thm.name} failed to elaborate: {errs}")
@@ -188,10 +206,9 @@ class REPLManager:
         ps = self._ps_ids.get(state.key)
         if ps is not None:
             return ps
-        thm = self._theorems[state.thm_name]
         if state.thm_name not in self._root_ps:
-            self._elab_root(thm)
-        ps: int = self._root_ps[state.thm_name]
+            self._elab_root(self._theorems[state.thm_name])
+        ps = self._root_ps[state.thm_name]
         for tac in state.tactics:
             resp = self._request({"tactic": tac, "proofState": ps}, self.tactic_timeout)
             if "proofState" not in resp:
@@ -218,11 +235,8 @@ class REPLManager:
             ps = self._ensure_ps(state)
             resp = self._request({"tactic": tactic, "proofState": ps}, self.tactic_timeout)
         except REPLTimeout:
-            self._restart()
             return ApplyResult("timeout", None, f"timeout: {tactic!r}")
         except REPLError as e:
-            if not self.repl.alive:
-                self._restart()
             return ApplyResult("error", None, str(e))
 
         if "proofState" not in resp:
@@ -241,17 +255,13 @@ class REPLManager:
     # -- certification -------------------------------------------------------
 
     def check_full_proof(self, thm: TheoremSpec, tactics: Tuple[str, ...]) -> Tuple[bool, str]:
-        """Re-elaborate the assembled proof from scratch: no errors, no sorries."""
+        """Re-elaborate the assembled proof from scratch: no errors, no sorries.
+        Returns (True, lean_source) or (False, reason)."""
         body = "\n".join(f"  {t}" for t in tactics)
-        code = f"{thm.statement} := by\n{body}"
-        cmd: dict = {"cmd": code}
-        if self.header_env is not None:
-            cmd["env"] = self.header_env
+        code = f"{thm.statement} := by\n{body}\n"
         try:
-            resp = self._request(cmd, self.cmd_timeout)
+            resp = self._request(self._cmd(code), self.cmd_timeout)
         except REPLError as e:
-            if not self.repl.alive:
-                self._restart()
             return False, str(e)
         errs = _error_messages(resp)
         if errs:

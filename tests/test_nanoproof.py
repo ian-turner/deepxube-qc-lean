@@ -72,7 +72,7 @@ def test_value_then_propose_is_one_call_and_carries_logprobs():
     s = LeanState("t", (GOAL_A,), ())
     (h,) = NanoproofValue(oracle).estimate([s], [LeanGoal(THM)])
     assert h == 2.4
-    (cands,) = NanoproofProvider(oracle).propose([ProposalRequest(s, THM)])
+    (cands,) = NanoproofProvider(oracle).propose([ProposalRequest(s)])
     assert [c.tactic for c in cands] == ["exact ⟨h.2, h.1⟩", "constructor"]  # banned dropped, best first
     assert cands[0].provenance == "nanoproof" and cands[0].score == -0.2
     assert srv.calls == 1  # value query stocked the tactic cache
@@ -99,13 +99,22 @@ def test_resample_refreshes_and_merges():
     srv, oracle = make(table)
     prov = NanoproofProvider(oracle)
     s = LeanState("t", (GOAL_A,), ())
-    (c1,) = prov.propose([ProposalRequest(s, THM)])
+    (c1,) = prov.propose([ProposalRequest(s)])
     assert [c.tactic for c in c1] == ["constructor"] and srv.calls == 1
     # failed set covers everything known -> re-sample, merge, keep value
-    (c2,) = prov.propose([ProposalRequest(s, THM, failed=("constructor",))])
+    (c2,) = prov.propose([ProposalRequest(s, failed=("constructor",))])
     assert [c.tactic for c in c2] == ["exact ⟨h.2, h.1⟩", "constructor"] and srv.calls == 2
     assert NanoproofValue(oracle).estimate([s], [LeanGoal(THM)]) == [3.0] and srv.calls == 2
     assert oracle.stats["refreshes"] == 1
+
+
+def test_empty_sample_is_resampled():
+    """A sample set that came back empty (all banned/duplicates) is re-sampled
+    right away instead of dead-ending the state."""
+    table = {GOAL_A: [(["sorry"], [-0.1], 3.0), (["constructor"], [-1.0], 3.0)]}
+    srv, oracle = make(table)
+    (cands,) = NanoproofProvider(oracle).propose([ProposalRequest(LeanState("t", (GOAL_A,), ()))])
+    assert [c.tactic for c in cands] == ["constructor"] and srv.calls == 2
 
 
 def test_busy_retry_and_error_fallback():
@@ -113,7 +122,7 @@ def test_busy_retry_and_error_fallback():
     s_ok, s_bad = LeanState("t", (GOAL_A,), ()), LeanState("t", ("⊢ False",), ())
     vals = NanoproofValue(oracle, default=9.0).estimate([s_ok, s_bad], [LeanGoal(THM)] * 2)
     assert vals == [1.0, 9.0] and srv.calls == 1 and oracle.client.n_busy == 2
-    (ok, bad) = NanoproofProvider(oracle).propose([ProposalRequest(s_ok, THM), ProposalRequest(s_bad, THM)])
+    (ok, bad) = NanoproofProvider(oracle).propose([ProposalRequest(s_ok), ProposalRequest(s_bad)])
     assert [c.tactic for c in ok] == ["rfl"] and bad == [] and srv.calls == 1
     assert oracle.stats["errors"] == 1
 

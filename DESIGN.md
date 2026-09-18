@@ -2,14 +2,13 @@
 
 ## What this is
 
-A generic Lean 4 theorem-proving environment for deepxube. The research framing: hold
-**pre-trained** models fixed — a tactic generator (policy) and a value estimator — and
-study what the *search harness* contributes: deepxube's batch weighted A* with
-transposition merging vs. the best-first/MCTS harnesses those models shipped with,
-under equal budgets. No model training in v1; every (state, tactic, outcome) is logged
-by construction, so training (expert iteration, learned value) can be added later
-without redesign. A quantum-circuit domain over QLean is a planned future plugin;
-nothing here is quantum-specific.
+A Lean 4 theorem-proving environment for deepxube. The research framing: hold a
+**pre-trained** policy+value model (nanoproof) fixed and study what the *search harness*
+contributes: deepxube's batch weighted A* with transposition merging vs. the MCTS harness
+the model shipped with, under equal budgets. No model training here; every (state,
+tactic, outcome) is logged by construction, so training (expert iteration, learned value)
+can be added later without redesign. A quantum-circuit domain over QLean is a planned
+future plugin; nothing here is quantum-specific.
 
 ## The mapping
 
@@ -28,15 +27,17 @@ Tactic applicability is only decidable by running the tactic, and deepxube has n
 "action failed" channel. So `get_state_actions` does the real work:
 
 ```
-PROPOSE  (ActionProviders: backbone menu ∪ LLM samples; batch across frontier)
+PROPOSE  (ActionProviders: nanoproof samples ∪ backbone menu; batch across frontier)
 VALIDATE (REPL applies each candidate; failures → per-state negative cache,
-          fed back into later prompts)
+          fed back to providers on re-proposal)
 CACHE    (successor states stored)
 ```
 
-and `next_state` is a pure cache lookup. States with zero valid tactics return empty
-action lists; the instance's frontier drains and it finishes unsolved (verified to
-flow through `ActsEnum.expand` — see tests).
+and `next_state` is a pure cache lookup. A state whose every candidate fails is
+re-proposed up to `--resamples` times with the failed set surfaced to the providers
+(nanoproof re-samples with a fresh server seed); if still empty it returns an empty
+action list, the instance's frontier drains and it finishes unsolved (verified to flow
+through `ActsEnum.expand` — see tests).
 
 ## Components (src/dxlean/)
 
@@ -44,44 +45,45 @@ flow through `ActsEnum.expand` — see tests).
   v4.30.0): `{"cmd"}` → env/sorries, `{"tactic","proofState"}` → new state or
   `{"message": "Lean error..."}`. Must run under `lake env` from the project dir
   (bare invocation yields an Init-less env where even `+` fails to parse).
-  `REPLManager` adds header env, state→proofState-id map, timeout kill/restart with
-  replay (states carry their tactic prefix, so any process can reconstruct them), and
+  `REPLManager` adds header env, state→proofState-id map, kill/restart with replay
+  (states carry their tactic prefix, so any process can reconstruct them), and
   `check_full_proof` — fresh elaboration of the assembled script; `sorry`/`admit`/
   `native_decide` banned. Failure taxonomy: ok / solved / error / **no_progress**
   (tactic succeeded, state unchanged — filtered to prevent self-loops) / timeout.
+  Any timeout restarts the process: a timed-out REPL is still computing and would
+  answer the *next* request with the stale reply, desyncing everything after it
+  (the reader thread is bound to its own queue for the same reason).
   **Self-reference guard**: the theorem is declared `:= by sorry`, so its own
   sorry-backed constant exists in the search-time environment; tactics mentioning
-  the theorem's name are rejected at the gate (found live — llama3 proposed
+  the theorem's name are rejected at the gate (found live — a model proposed
   `apply and_swap` inside `and_swap` and search "solved" it; certification in the
   pristine header env rejected it, and now search never accepts it either).
-- `providers.py` — `ActionProvider` ABC (batch propose), `BackboneProvider` (fixed
-  menu; guaranteed recall on routine closers), `LLMSampler` (prompt → k tactics, one
-  per line; parses/normalizes/filters), `UnionProvider` (order-preserving dedupe, cap).
-- `values.py` — `ValueProvider` ABC, `GoalCountValue` (deterministic, model-free),
-  `LLMJudgeValue` ("steps remaining" integer, cached by state key), `as_heurv` adapter.
 - `nanoproof.py` — the pre-trained nanoproof checkpoint as plugins. Speaks nanoproof's
   own Flask inference protocol (`POST /generate {"states"} -> tactics+logprobs+value`,
   503 = busy, retried). One `NanoproofOracle` cache (keyed by prompt string) backs both
-  `NanoproofProvider` (samples as candidates, logprob as score, re-proposal re-samples
-  with a fresh server seed and merges) and `NanoproofValue` (h = predicted remaining
-  proof depth, 1..64 bins, unscaled). deepxube scores children at generation and
-  expands them later, so the value query already stocks the tactic cache: one GPU
-  call per state. Goal text is re-rendered the way leantree (nanoproof's training
-  data) prints it — grouped hypotheses `a b : ℕ` split one per line.
-- `llm.py` — minimal OpenAI-compatible chat client (works with ollama/LM Studio/mlx
-  locally and vLLM on the CUDA server) + `FakeChatClient` for deterministic tests.
-- `domain.py` — the `ActsEnum` domain: propose→validate→cache, stats counters.
+  `NanoproofProvider` (samples as candidates, logprob as score; re-proposal or an empty
+  sample re-queries with a fresh server seed and merges) and `NanoproofValue` (h =
+  predicted remaining proof depth, 1..64 bins, unscaled). deepxube scores children at
+  generation and expands them later, so the value query already stocks the tactic
+  cache: one GPU call per state. Goal text is re-rendered the way leantree
+  (nanoproof's training data) prints it — grouped hypotheses `a b : ℕ` split one per
+  line.
+- `providers.py` — `ActionProvider` ABC (batch propose), `BackboneProvider` (fixed
+  menu; guaranteed recall on routine closers and the model-free path for tests),
+  `UnionProvider` (order-preserving dedupe, cap).
+- `values.py` — `ValueProvider` ABC, `GoalCountValue` (deterministic, model-free),
+  `as_heurv` adapter.
+- `domain.py` — the `ActsEnum` domain: propose→validate→cache, resampling, stats.
 - `solve.py` — all theorems run as concurrent search instances (provider/value calls
   batch across the whole frontier); finished instances → path extraction
   (`get_path`) → certification → `SolveResult`.
-- `cli.py` — `dxlean solve` with knobs for backbone menu, endpoint/model, value
-  choice, W/B/eps/k/cap/itr-max, results + verified-proof output; `dxlean viz`
-  for the views below.
+- `cli.py` — `dxlean solve` (nanoproof URL, backbone menu, value choice,
+  W/B/eps/cap/itr-max, results + verified-proof output) and `dxlean viz`.
 - `viz.py` — visualization of the environment and search process, all text-first
   on the REPL's pretty-printed goals: `render_state_goal` (matplotlib figure —
   backs the deepxube `StateGoalVizable` mixin on `LeanDomain`, which also
   implements `StringToAct`), `interactive` (proof shell with provider proposals
-  and undo), `traced_search` (per-iteration narration + search-tree print;
+  and undo), `traced_search` (per-iteration narration + search-tree print/figure;
   deepxube keeps the tree in `Node.edge_dict`, so the tree view is a free walk).
 
 ## Verified deepxube integration points
@@ -95,18 +97,15 @@ flow through `ActsEnum.expand` — see tests).
 - `set_is_solved` runs on *popped* nodes; a solved child must be popped to register —
   fine, it has h = 0 so it pops immediately.
 
-## Current status / known limits (v1)
+## Current status / known limits
 
 - Single REPL process, sequential validation. Fine Mathlib-free (ms/tactic); a worker
   pool with state affinity is the first scaling step for Mathlib-based benchmarks.
-- One LLM request per state proposal (no cross-state HTTP batching yet); vLLM
-  continuous batching will want concurrent requests.
 - Transition/negative caches are in-memory per run; persisting them (and logging them
   as the training-data harvest) is designed but not built.
 - Dev corpus is core-Lean-only. `exact?` in the default backbone one-shots most of it —
   use `--backbone` without it to exercise real search; miniF2F/Mathlib benchmarks are
   the next corpus step (per-benchmark toolchain/REPL matching needed).
-
 - nanoproof pins Lean v4.27.0 + Mathlib; testproj is v4.30.0 without Mathlib. Its
   samples are Mathlib-shaped, so evaluate it against the cluster's Mathlib project
   with a matching REPL (`scripts/setup_repl.sh nanoproof` reads the pin from the
@@ -116,16 +115,13 @@ flow through `ActsEnum.expand` — see tests).
 
 ## Roadmap
 
-1. **Server config**: nanoproof served via `scripts/train_nanoproof.sh serve` (done);
-   optionally a vLLM-served open prover pair (e.g. InternLM2.5-StepProver + its
-   critic as a `ValueProvider`; prompt formats matched to the models' training).
-2. **Benchmarks**: Mathlib-extracted dev corpus (volume, difficulty spread), then
+1. **Benchmarks**: Mathlib-extracted dev corpus (volume, difficulty spread), then
    miniF2F-test for citable numbers.
-3. **Harness grid**: {best-first reproduction, WA* W-sweep, batch-size sweep, eps
-   exploration} × {logprob, critic, judge} with honest wall-clock/GPU accounting.
-4. **Scaling**: REPL worker pool with state affinity; concurrent LLM requests;
-   persistent transition cache doubling as the harvest log.
-5. **Later**: expert iteration on the sampler; learned value via deepxube training
+2. **Harness grid**: {nanoproof MCTS reproduction, WA* W-sweep, batch-size sweep, eps
+   exploration} × {`--np-value` modes} with honest wall-clock/GPU accounting.
+3. **Scaling**: REPL worker pool with state affinity; persistent transition cache
+   doubling as the harvest log.
+4. **Later**: expert iteration on the sampler; learned value via deepxube training
    (requires a difficulty-parameterized problem generator — domain-specific by
    nature); QLean quantum-circuit plugin with its scrambler as both curriculum and
    in-domain SFT corpus.

@@ -1,19 +1,15 @@
 """Command-line entry point.
 
 Examples:
-  # backbone tactics only, deterministic heuristic (no LLM anywhere):
-  dxlean solve --problems problems/dev.jsonl --no-llm
-
   # pre-trained nanoproof policy+value served from the GPU cluster
   # (scripts/train_nanoproof.sh serve, then ssh -L 5001:localhost:5001 <node>):
   dxlean solve --problems problems/dev.jsonl --nanoproof http://localhost:5001 --backbone ""
 
-  # local model via any OpenAI-compatible server (ollama, LM Studio, mlx, vllm):
-  dxlean solve --problems problems/dev.jsonl \
-      --endpoint http://localhost:11434/v1 --model qwen2.5-coder:7b --value judge
+  # no model anywhere: backbone tactic menu + goal-count heuristic (smoke test):
+  dxlean solve --problems problems/dev.jsonl
 
   # watch the search think on one theorem (per-iteration narration + tree):
-  dxlean viz --problems problems/dev.jsonl --name and_swap --no-llm \
+  dxlean viz --problems problems/dev.jsonl --name and_swap \
       --backbone "intro h,constructor,assumption,rfl,omega"
 
   # interactive proof shell (:p asks the providers, :u undoes, :q quits):
@@ -25,17 +21,16 @@ import argparse
 import json
 import os
 import sys
-from typing import List
+from typing import List, Optional, Tuple
 
 from .domain import LeanDomain
-from .llm import ChatClient
 from .nanoproof import (GOAL_MODES, VALUE_MODES, NanoproofClient, NanoproofOracle,
                         NanoproofProvider, NanoproofValue)
-from .providers import BackboneProvider, LLMSampler, UnionProvider
+from .providers import ActionProvider, BackboneProvider, UnionProvider
 from .repl import REPLManager
 from .solve import solve
 from .states import TheoremSpec
-from .values import GoalCountValue, LLMJudgeValue
+from .values import GoalCountValue, ValueProvider
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -45,10 +40,9 @@ def load_problems(path: str) -> List[TheoremSpec]:
     with open(path) as f:
         for line in f:
             line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            row = json.loads(line)
-            theorems.append(TheoremSpec(row["name"], row["statement"]))
+            if line and not line.startswith("#"):
+                row = json.loads(line)
+                theorems.append(TheoremSpec(row["name"], row["statement"]))
     return theorems
 
 
@@ -57,11 +51,6 @@ def _add_common_args(s: argparse.ArgumentParser) -> None:
     s.add_argument("--project", default=os.path.join(ROOT, "lean", "testproj"), help="Lean project dir")
     s.add_argument("--repl-bin", default=os.path.join(ROOT, "vendor", "repl", ".lake", "build", "bin", "repl"))
     s.add_argument("--header", default="import TestProj", help="Lean header (imports) for the session env")
-    s.add_argument("--endpoint", default=None, help="OpenAI-compatible base URL, e.g. http://localhost:11434/v1")
-    s.add_argument("--model", default=None)
-    s.add_argument("--no-llm", action="store_true", help="backbone tactics only")
-    s.add_argument("--backbone", default=None,
-                   help="comma-separated backbone tactic menu ('' disables backbone; default: built-in menu)")
     s.add_argument("--nanoproof", default=None, metavar="URL",
                    help="nanoproof inference server, e.g. http://localhost:5001 "
                         "(scripts/train_nanoproof.sh serve; ssh -L to reach it from a laptop)")
@@ -71,10 +60,10 @@ def _add_common_args(s: argparse.ArgumentParser) -> None:
     s.add_argument("--np-value", choices=VALUE_MODES, default="sum",
                    help="nanoproof h: sum of per-goal depth predictions, first goal only, or all goals joined")
     s.add_argument("--np-chunk", type=int, default=32, help="states per nanoproof HTTP request")
-    s.add_argument("--value", choices=["goalcount", "judge", "nanoproof"], default=None,
+    s.add_argument("--backbone", default=None,
+                   help="comma-separated backbone tactic menu ('' disables backbone; default: built-in menu)")
+    s.add_argument("--value", choices=["goalcount", "nanoproof"], default=None,
                    help="heuristic (default: nanoproof when --nanoproof is given, else goalcount)")
-    s.add_argument("--k", type=int, default=8, help="LLM tactic samples per state")
-    s.add_argument("--temperature", type=float, default=0.7)
     s.add_argument("--cap", type=int, default=24, help="max candidates validated per state")
     s.add_argument("--resamples", type=int, default=2,
                    help="re-proposal rounds (failed tactics fed back) before a state is a dead end")
@@ -83,24 +72,19 @@ def _add_common_args(s: argparse.ArgumentParser) -> None:
     s.add_argument("--eps", type=float, default=0.0, help="chance of random pop (exploration)")
     s.add_argument("--itr-max", type=int, default=100, help="search iterations per theorem")
     s.add_argument("--tactic-timeout", type=float, default=20.0)
+    s.add_argument("--cmd-timeout", type=float, default=600.0,
+                   help="seconds allowed for header import, root elaboration and full-proof checks "
+                        "(a cold `import Mathlib` can take several minutes)")
 
 
-def _build(p: argparse.ArgumentParser, args: argparse.Namespace):
-    """Construct (repl, provider, value) from parsed common args."""
-    use_llm = not args.no_llm and args.endpoint is not None
-    if not args.no_llm and args.endpoint is None and not args.nanoproof:
-        print("[dxlean] no --endpoint/--nanoproof given: running backbone-only (pass --no-llm to silence)")
-    client = None
-    if use_llm:
-        if args.model is None:
-            p.error("--model is required with --endpoint")
-        client = ChatClient(args.endpoint, args.model)
-
-    providers = []
+def _build(p: argparse.ArgumentParser, args: argparse.Namespace
+           ) -> Tuple[REPLManager, ActionProvider, ValueProvider, Optional[NanoproofOracle]]:
+    providers: List[ActionProvider] = []
     if args.backbone is None:
         providers.append(BackboneProvider())
     elif args.backbone.strip():
         providers.append(BackboneProvider([t.strip() for t in args.backbone.split(",") if t.strip()]))
+
     oracle = None
     if args.nanoproof:
         oracle = NanoproofOracle(NanoproofClient(args.nanoproof, chunk=args.np_chunk),
@@ -110,45 +94,36 @@ def _build(p: argparse.ArgumentParser, args: argparse.Namespace):
         except Exception as e:
             p.error(f"nanoproof server {args.nanoproof} not reachable: {e}")
         providers.append(NanoproofProvider(oracle))
-    if client is not None:
-        providers.append(LLMSampler(client, k=args.k, temperature=args.temperature))
     if not providers:
-        p.error("no action providers: give --backbone, --nanoproof, or an --endpoint")
-    provider = UnionProvider(providers, cap=args.cap)
+        p.error("no action providers: give --backbone or --nanoproof")
 
     value_choice = args.value or ("nanoproof" if oracle is not None else "goalcount")
-    if value_choice == "judge":
-        if client is None:
-            p.error("--value judge requires --endpoint/--model")
-        value = LLMJudgeValue(client)
-    elif value_choice == "nanoproof":
+    if value_choice == "nanoproof":
         if oracle is None:
             p.error("--value nanoproof requires --nanoproof URL")
-        value = NanoproofValue(oracle)
+        value: ValueProvider = NanoproofValue(oracle)
     else:
         value = GoalCountValue()
-    args.oracle = oracle
 
     repl = REPLManager(args.project, args.repl_bin, header=args.header,
-                       tactic_timeout=args.tactic_timeout)
-    return repl, provider, value
+                       tactic_timeout=args.tactic_timeout, cmd_timeout=args.cmd_timeout)
+    return repl, UnionProvider(providers, cap=args.cap), value, oracle
 
 
 def _cmd_solve(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     theorems = load_problems(args.problems)
-    repl, provider, value = _build(p, args)
+    repl, provider, value, oracle = _build(p, args)
     repl.start()
     try:
-        domain = LeanDomain(repl, provider, {t.name: t for t in theorems},
-                            max_resamples=args.resamples)
+        domain = LeanDomain(repl, provider, max_resamples=args.resamples)
         results = solve(theorems, repl, domain, value, weight=args.weight,
                         batch_size=args.batch, eps=args.eps, itr_max=args.itr_max,
                         verbose=not args.quiet)
     finally:
         repl.stop()
-    if args.oracle is not None and not args.quiet:
-        print(f"[dxlean] nanoproof: {args.oracle.stats} | http requests: {args.oracle.client.n_requests}, "
-              f"busy retries: {args.oracle.client.n_busy}")
+    if oracle is not None and not args.quiet:
+        print(f"[dxlean] nanoproof: {oracle.stats} | http requests: {oracle.client.n_requests}, "
+              f"busy retries: {oracle.client.n_busy}")
 
     if args.out:
         os.makedirs(os.path.join(args.out, "proofs"), exist_ok=True)
@@ -156,14 +131,12 @@ def _cmd_solve(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
             for r in results:
                 f.write(json.dumps({
                     "name": r.name, "solved": r.solved, "verified": r.verified,
-                    "tactics": r.tactics, "path_cost": r.path_cost,
-                    "iterations": r.iterations, "message": r.message,
+                    "tactics": r.tactics, "iterations": r.iterations, "message": r.message,
                 }) + "\n")
-        by_name = {t.name: t for t in theorems}
         for r in results:
             if r.verified:
                 with open(os.path.join(args.out, "proofs", f"{r.name}.lean"), "w") as f:
-                    f.write(r.proof_text(by_name[r.name].statement))
+                    f.write(r.proof)
         print(f"[dxlean] wrote {args.out}/results.jsonl")
 
     n_solved = sum(r.solved for r in results)
@@ -184,14 +157,13 @@ def _cmd_viz(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     else:
         p.error(f"unknown theorem {args.name!r}; available: {', '.join(by_name)}")
 
-    repl, provider, value = _build(p, args)
+    repl, provider, value, _ = _build(p, args)
     repl.start()
     try:
         if args.interactive:
-            viz.interactive(repl, provider, thm, value_provider=value)
+            viz.interactive(repl, provider, value, thm)
         else:
-            domain = LeanDomain(repl, provider, {thm.name: thm},
-                                max_resamples=args.resamples)
+            domain = LeanDomain(repl, provider, max_resamples=args.resamples)
             viz.traced_search(thm, repl, domain, value, weight=args.weight,
                               batch_size=args.batch, eps=args.eps, itr_max=args.itr_max,
                               fig_path=args.fig)

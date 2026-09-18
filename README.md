@@ -1,13 +1,11 @@
 # dxlean
 
-Generic Lean 4 theorem proving as a [deepxube](https://github.com/forestagostinelli/deepxube)
+Lean 4 theorem proving as a [deepxube](https://github.com/forestagostinelli/deepxube)
 pathfinding domain: **states** are Lean proof states, **actions** are tactics proposed by
-pluggable providers (a fixed backbone menu and/or an LLM behind any OpenAI-compatible
-endpoint), **guidance** comes from pluggable value providers, and **search** is deepxube's
-batch weighted A*. Found proofs are re-certified by fresh elaboration.
-
-Runs locally on a MacBook with small models (ollama / LM Studio / mlx) and on a CUDA
-server with vLLM-served provers — the code only ever sees an endpoint URL.
+the pre-trained [nanoproof](https://github.com/Kripner/nanoproof) policy (plus an optional
+fixed backbone menu), **guidance** is nanoproof's value head (predicted remaining proof
+depth), and **search** is deepxube's batch weighted A*. Found proofs are re-certified by
+fresh elaboration.
 
 See [DESIGN.md](DESIGN.md) for architecture and roadmap.
 
@@ -18,52 +16,25 @@ uv venv --python 3.12 .venv
 uv pip install -p .venv/bin/python -e ".[dev]"   # installs deepxube (pinned git sha), torch, etc.
 ./scripts/setup_repl.sh                          # clone + build leanprover-community/repl v4.30.0
 cd lean/testproj && lake build && cd ../..       # build the dev Lean project (no Mathlib, seconds)
-.venv/bin/python -m pytest tests/ -q             # 8 tests, needs the REPL built
+.venv/bin/python -m pytest tests/ -q             # needs the REPL built; no GPU or server needed
 ```
 
 Requires `elan` (the toolchain in `lean/testproj/lean-toolchain` is fetched automatically).
 
 ## Usage
 
-```bash
-# No LLM anywhere: backbone tactic menu + deterministic goal-count heuristic
-dxlean solve --problems problems/dev.jsonl --no-llm
-
-# Restricted backbone (forces real multi-step search; some problems honestly fail)
-dxlean solve --problems problems/dev.jsonl --no-llm \
-    --backbone "intro h,constructor,assumption,rfl,omega"
-
-# Local model via ollama (`ollama serve` + `ollama pull qwen2.5-coder:7b` first)
-dxlean solve --problems problems/dev.jsonl \
-    --endpoint http://localhost:11434/v1 --model qwen2.5-coder:7b --value judge
-
-# CUDA server: point at vLLM serving a prover model
-dxlean solve --problems my_bench.jsonl \
-    --endpoint http://gpu-server:8000/v1 --model <served-model> --value judge \
-    --k 12 --batch 4 --weight 1.0 --itr-max 300 --out results/run1
-```
-
-### Pre-trained nanoproof policy + value
-
-[nanoproof](https://github.com/Kripner/nanoproof) trains a ~1B policy+value model
-(`scripts/train_nanoproof.sh`); dxlean uses the checkpoint through nanoproof's own
-HTTP inference server, so the model never leaves the GPU cluster:
+nanoproof's policy+value checkpoint is served by nanoproof's own HTTP inference server
+(`scripts/train_nanoproof.sh` trains it and has a `serve` stage), so the model never
+leaves the GPU cluster:
 
 ```bash
 # on the cluster — serve prints the companion dxlean command with the right flags
 scripts/train_nanoproof.sh serve            # port NP_INFER_PORT, default 5001
 ```
 
-One request per state yields tactic samples (with logprobs, kept as candidate scores) and
-the value-head prediction, which is *remaining proof depth in tactic steps* — used
-unscaled as `h`. `--value` defaults to `nanoproof` when `--nanoproof` is given; combine
-with `--backbone` / `--endpoint` providers freely. `--np-goals` picks what the policy
-sees (first goal, as in nanoproof's factorized search, or all goals), `--np-value` how
-`h` is assembled (sum of per-goal depths, first goal, or all goals joined).
-
-The model was trained on Lean v4.27.0 + Mathlib states, so against the Mathlib-free
-testproj most of its samples will fail validation. For honest numbers run dxlean **on
-the cluster** against the Mathlib project the training script builds (`leanproj` stage):
+The model was trained on Lean v4.27.0 + Mathlib states, so run dxlean **on the cluster**
+against the Mathlib project the training script builds (`leanproj` stage), with a REPL
+built for the matching Lean version:
 
 ```bash
 # build the REPL version that matches nanoproof's Lean pin (reads it from train_nanoproof.sh)
@@ -72,17 +43,35 @@ the cluster** against the Mathlib project the training script builds (`leanproj`
 # run on the same machine as the Lean project (--project must be a local path)
 dxlean solve --problems my_bench.jsonl --nanoproof http://localhost:5001 --backbone "" \
     --project /work/$USER/nptraining --header "import Mathlib" \
-    --repl-bin vendor/repl-v4.27.0/.lake/build/bin/repl
+    --repl-bin vendor/repl-v4.27.0/.lake/build/bin/repl --out results/run1
+```
+
+One request per state yields tactic samples (with logprobs, kept as candidate scores) and
+the value-head prediction, *remaining proof depth in tactic steps*, used unscaled as `h`.
+`--np-goals` picks what the policy sees (first goal, as in nanoproof's factorized search,
+or all goals), `--np-value` how `h` is assembled (sum of per-goal depths, first goal, or
+all goals joined). `--backbone ""` disables the built-in tactic menu; omit it to union the
+menu with the model's samples, or pass your own comma-separated menu.
+
+Without `--nanoproof` the search runs model-free (backbone menu + goal-count heuristic),
+which is the GPU-free smoke path used by the tests:
+
+```bash
+dxlean solve --problems problems/dev.jsonl
 ```
 
 Problem files are JSONL: `{"name": ..., "statement": "theorem foo ... : ..."}` — the
 statement without a proof; the harness appends `:= by sorry` and searches from there.
 `--header` sets the imports for the session (default `import TestProj`); `--project`
-points at the Lean project whose environment the REPL runs in.
+points at the Lean project whose environment the REPL runs in. `--cmd-timeout` (default
+600s) bounds the header import and full-proof checks; a cold `import Mathlib` from a
+network filesystem can take several minutes, and the header is re-imported on every REPL
+restart.
 
 Key knobs: `--weight` (on path cost: `W*g + h`, lower = greedier), `--batch` (nodes
-expanded per search iteration per theorem), `--k` (LLM samples per state), `--cap`
-(max candidates REPL-validated per state), `--itr-max` (search budget per theorem).
+expanded per search iteration per theorem), `--cap` (max candidates REPL-validated per
+state), `--resamples` (re-proposal rounds with failure feedback before a state is a dead
+end), `--itr-max` (search budget per theorem).
 
 Results land in `--out`: `results.jsonl` plus `proofs/<name>.lean` for every proof
 that passed certification.
@@ -91,25 +80,16 @@ that passed certification.
 
 ```bash
 # watch the search think: per-iteration narration (popped node, f=W*g+h, which
-# candidates validated, provenance) + final search tree with the solution path starred
-dxlean viz --problems problems/dev.jsonl --name and_swap --no-llm \
-    --backbone "intro h,constructor,assumption,rfl,omega"
+# candidates validated, provenance) + final search tree with the solution path starred;
+# --fig also renders the tree as a PNG
+dxlean viz --problems problems/dev.jsonl --name and_swap \
+    --backbone "intro h,constructor,assumption,rfl,omega" --fig and_swap.png
 
 # interactive proof shell: type tactics, :p asks providers for validated
 # proposals, :u undoes, :g reprints goals, :q quits
 dxlean viz --problems problems/dev.jsonl --name or_swap --interactive
-
-# render the root state/goal as a matplotlib figure (deepxube StateGoalVizable)
-dxlean viz --problems problems/dev.jsonl --name and_swap --no-llm --fig root.png
-
-# LLM-only search (no backbone menu): every tactic in the trace and tree is
-# tagged [llm]. When every sample fails, the state is re-proposed with the
-# failed tactics fed back to the sampler (--resamples, default 2) before it
-# becomes a dead end; low temperature still helps small models.
-dxlean viz --problems problems/dev.jsonl --name imp_chain \
-    --endpoint http://localhost:11434/v1 --model qwen2.5-coder:7b \
-    --backbone "" --temperature 0.2 --itr-max 25 --fig imp_chain_llm.png
 ```
 
-Tree legend: `★` solution path, `✓` solved state, `✗` expanded dead end (no valid
-tactics), `·` generated but never expanded.
+Both take the same `--nanoproof` / `--backbone` flags as `solve`. Tree legend: `★`
+solution path, `✓` solved state, `✗` expanded dead end (no valid tactics), `·` generated
+but never expanded.
