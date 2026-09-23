@@ -1,4 +1,4 @@
-"""Core types: theorem specs, proof states, and tactic actions.
+"""Core types: theorem specs, proof states, tactic actions, and the cost ledger.
 
 A LeanState is a full Lean proof state (all remaining goals) reached from a
 theorem's root `sorry` by a sequence of tactics. Identity (hash/eq) is the
@@ -9,8 +9,9 @@ deepxube's CLOSED dict works across different tactic orderings, while replay
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import DefaultDict, Optional, Tuple
 
 from deepxube.base.domain import Action, Goal, State
 
@@ -86,3 +87,8 @@ class TacticAction(Action):
 
     def __repr__(self) -> str:
         return self.tactic
+
+
+# theorem name -> {"model_calls", "validations"}: per-theorem costs, the currency for
+# budgets and benchmarks; shared by the domain and the model-backed providers
+Ledger = DefaultDict[str, Counter]

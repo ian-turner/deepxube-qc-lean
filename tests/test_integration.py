@@ -135,6 +135,43 @@ def test_solve_multistep_with_scripted_model(repl):
     assert provider.n_calls >= 5
 
 
+def test_budgets_and_terminal_messages(repl):
+    """`calls_max` bounds the ledger's model calls per theorem (nanoproof's
+    simulation currency); a solved child counts as soon as it exists, even when
+    A* would pop something else first; results carry the costs and the reason
+    the search ended."""
+    class CountingValue(GoalCountValue):  # one model call per state scored
+        def __init__(self, ledger):
+            self.ledger = ledger
+
+        def estimate(self, states, goals):
+            for s in states:
+                self.ledger[s.thm_name]["model_calls"] += 1
+            return super().estimate(states, goals)
+
+    def run(thm, provider, **kw):
+        domain = LeanDomain(repl, provider, max_resamples=0)
+        (res,) = solve([thm], repl, domain, CountingValue(domain.ledger), **kw)
+        return res
+
+    chain = TheoremSpec("tst_budget", "theorem tst_budget (p q r : Prop) (hpq : p → q) (hqr : q → r) (hp : p) : r")
+    steps = ScriptedProvider({"⊢ r": ["apply hqr"], "⊢ q": ["apply hpq"], "⊢ p": ["exact hp"]})
+    res = run(chain, steps, calls_max=2)  # root and its child scored, then cut off
+    assert not res.solved and res.message == "model-call budget"
+    assert res.model_calls == 2 and res.validations == 1
+    res = run(chain, steps, calls_max=4)  # the solved child is the 4th state scored: counts
+    assert res.verified and res.model_calls == 4 and res.validations == 3
+    assert res.tactics == ["apply hqr", "apply hpq", "exact hp"]
+    assert run(chain, steps, itr_max=1).message == "iteration limit"
+    assert run(chain, ScriptedProvider({"⊢ r": ["nonsense"]})).message == "search exhausted"
+
+    # W=2 makes A* pop the sibling `⊢ q` (f = 2*1 + h) before the solved child (f = 2*2 + 0)
+    pair = TheoremSpec("tst_pair", "theorem tst_pair (p q : Prop) (hp : p) (hq : q) : p ∧ q")
+    split = ScriptedProvider({"⊢ p ∧ q": ["refine ⟨?_, hq⟩", "refine ⟨hp, ?_⟩"], "⊢ p": ["exact hp"]})
+    res = run(pair, split, weight=2.0, calls_max=4)
+    assert res.verified and res.model_calls == 4 and res.tactics == ["refine ⟨?_, hq⟩", "exact hp"]
+
+
 def test_resample_recovers_from_bad_round(repl):
     """One bad sample round must not permanently dead-end a state: the domain
     re-proposes with the failed tactics fed back to the provider."""

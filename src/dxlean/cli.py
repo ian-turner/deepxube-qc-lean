@@ -21,6 +21,9 @@ import argparse
 import json
 import os
 import sys
+import time
+from collections import Counter, defaultdict
+from dataclasses import asdict
 from typing import List, Optional, Tuple
 
 from .domain import LeanDomain
@@ -70,7 +73,10 @@ def _add_common_args(s: argparse.ArgumentParser) -> None:
     s.add_argument("--weight", type=float, default=1.0, help="weight on path cost (W*g + h); lower = greedier")
     s.add_argument("--batch", type=int, default=1, help="nodes expanded per search iteration per instance")
     s.add_argument("--eps", type=float, default=0.0, help="chance of random pop (exploration)")
-    s.add_argument("--itr-max", type=int, default=100, help="search iterations per theorem")
+    s.add_argument("--itr-max", type=int, default=None,
+                   help="search iterations per theorem (default 100, unlimited with --calls-max)")
+    s.add_argument("--calls-max", type=int, default=None,
+                   help="model calls per theorem, nanoproof's simulation budget (default: unlimited)")
     s.add_argument("--tactic-timeout", type=float, default=20.0)
     s.add_argument("--cmd-timeout", type=float, default=600.0,
                    help="seconds allowed for header import, root elaboration and full-proof checks "
@@ -78,7 +84,10 @@ def _add_common_args(s: argparse.ArgumentParser) -> None:
 
 
 def _build(p: argparse.ArgumentParser, args: argparse.Namespace
-           ) -> Tuple[REPLManager, ActionProvider, ValueProvider, Optional[NanoproofOracle]]:
+           ) -> Tuple[REPLManager, LeanDomain, ValueProvider, Optional[NanoproofOracle]]:
+    if args.itr_max is None:
+        args.itr_max = 10**9 if args.calls_max else 100  # one budget knob at a time
+    ledger = defaultdict(Counter)  # per-theorem model calls + validations, shared by oracle and domain
     providers: List[ActionProvider] = []
     if args.backbone is None:
         providers.append(BackboneProvider())
@@ -88,7 +97,7 @@ def _build(p: argparse.ArgumentParser, args: argparse.Namespace
     oracle = None
     if args.nanoproof:
         oracle = NanoproofOracle(NanoproofClient(args.nanoproof, chunk=args.np_chunk),
-                                 goal_mode=args.np_goals, value_mode=args.np_value)
+                                 goal_mode=args.np_goals, value_mode=args.np_value, ledger=ledger)
         try:
             oracle.client.health()
         except Exception as e:
@@ -107,40 +116,47 @@ def _build(p: argparse.ArgumentParser, args: argparse.Namespace
 
     repl = REPLManager(args.project, args.repl_bin, header=args.header,
                        tactic_timeout=args.tactic_timeout, cmd_timeout=args.cmd_timeout)
-    return repl, UnionProvider(providers, cap=args.cap), value, oracle
+    domain = LeanDomain(repl, UnionProvider(providers, cap=args.cap), max_resamples=args.resamples,
+                        ledger=ledger)
+    return repl, domain, value, oracle
 
 
 def _cmd_solve(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     theorems = load_problems(args.problems)
-    repl, provider, value, oracle = _build(p, args)
+    repl, domain, value, oracle = _build(p, args)
+    t0 = time.time()
     repl.start()
     try:
-        domain = LeanDomain(repl, provider, max_resamples=args.resamples)
         results = solve(theorems, repl, domain, value, weight=args.weight,
                         batch_size=args.batch, eps=args.eps, itr_max=args.itr_max,
-                        verbose=not args.quiet)
+                        calls_max=args.calls_max, verbose=not args.quiet)
     finally:
         repl.stop()
+    elapsed = time.time() - t0
     if oracle is not None and not args.quiet:
         print(f"[dxlean] nanoproof: {oracle.stats} | http requests: {oracle.client.n_requests}, "
               f"busy retries: {oracle.client.n_busy}")
 
+    n_solved = sum(r.solved for r in results)
+    n_verified = sum(r.verified for r in results)
     if args.out:
         os.makedirs(os.path.join(args.out, "proofs"), exist_ok=True)
         with open(os.path.join(args.out, "results.jsonl"), "w") as f:
             for r in results:
-                f.write(json.dumps({
-                    "name": r.name, "solved": r.solved, "verified": r.verified,
-                    "tactics": r.tactics, "iterations": r.iterations, "message": r.message,
-                }) + "\n")
+                f.write(json.dumps({k: v for k, v in asdict(r).items() if k != "proof"}) + "\n")
         for r in results:
             if r.verified:
                 with open(os.path.join(args.out, "proofs", f"{r.name}.lean"), "w") as f:
                     f.write(r.proof)
-        print(f"[dxlean] wrote {args.out}/results.jsonl")
+        with open(os.path.join(args.out, "summary.json"), "w") as f:
+            json.dump({"total": len(results), "solved": n_solved, "verified": n_verified,
+                       "elapsed_seconds": elapsed,
+                       "model_calls": sum(r.model_calls for r in results),
+                       "validations": sum(r.validations for r in results),
+                       "repl_requests": repl.n_requests, "repl_restarts": repl.n_restarts,
+                       "args": vars(args)}, f, indent=1)
+        print(f"[dxlean] wrote {args.out}/results.jsonl and summary.json")
 
-    n_solved = sum(r.solved for r in results)
-    n_verified = sum(r.verified for r in results)
     print(f"[dxlean] solved {n_solved}/{len(results)}, verified {n_verified}/{len(results)}")
     sys.exit(0 if n_solved == len(results) else 1)
 
@@ -157,13 +173,12 @@ def _cmd_viz(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     else:
         p.error(f"unknown theorem {args.name!r}; available: {', '.join(by_name)}")
 
-    repl, provider, value, _ = _build(p, args)
+    repl, domain, value, _ = _build(p, args)
     repl.start()
     try:
         if args.interactive:
-            viz.interactive(repl, provider, value, thm)
+            viz.interactive(repl, domain.provider, value, thm)
         else:
-            domain = LeanDomain(repl, provider, max_resamples=args.resamples)
             viz.traced_search(thm, repl, domain, value, weight=args.weight,
                               batch_size=args.batch, eps=args.eps, itr_max=args.itr_max,
                               fig_path=args.fig)

@@ -34,13 +34,14 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from collections import Counter, defaultdict
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import httpx
 
 from .providers import ActionProvider, Candidate, ProposalRequest
 from .repl import BANNED_SUBSTRINGS
-from .states import LeanGoal, LeanState
+from .states import LeanGoal, LeanState, Ledger
 from .values import ValueProvider
 
 GOAL_MODES = ("first", "all")          # what the policy sees
@@ -156,15 +157,25 @@ class NanoproofOracle:
     already cached (new server seed) and merges them, keeping the value."""
 
     def __init__(self, client: NanoproofClient, goal_mode: str = "first",
-                 value_mode: str = "sum"):
+                 value_mode: str = "sum", ledger: Optional[Ledger] = None):
         assert goal_mode in GOAL_MODES and value_mode in VALUE_MODES
         self.client = client
         self.goal_mode = goal_mode
         self.value_mode = value_mode
+        self.ledger: Ledger = ledger if ledger is not None else defaultdict(Counter)
         self._cache: Dict[str, NanoResult] = {}
+        self._charged: Set[Tuple[str, str]] = set()  # (theorem, prompt) pairs already paid for
         self.stats: Dict[str, int] = {"states_sent": 0, "cache_hits": 0, "refreshes": 0, "errors": 0}
 
-    def query(self, prompts: Sequence[str]) -> List[NanoResult]:
+    def query(self, prompts: Sequence[str], thms: Sequence[str]) -> List[NanoResult]:
+        """Cache-first fetch. Each theorem pays one model call the first time it
+        asks for a prompt (`thms[i]` owns `prompts[i]`), so its cost is what it
+        would have paid alone: a transposition inside the theorem is free, a
+        goal some other theorem already cached is not."""
+        new = [tp for tp in dict.fromkeys(zip(thms, prompts)) if tp not in self._charged]
+        self._charged.update(new)
+        for thm, _ in new:
+            self.ledger[thm]["model_calls"] += 1
         missing = list(dict.fromkeys(p for p in prompts if p not in self._cache))
         self.stats["cache_hits"] += sum(p in self._cache for p in prompts)
         if missing:
@@ -173,13 +184,15 @@ class NanoproofOracle:
                 self._cache[p] = res
         return [self._cache[p] for p in prompts]
 
-    def refresh(self, prompts: Sequence[str]) -> List[NanoResult]:
+    def refresh(self, prompts: Sequence[str], thms: Sequence[str]) -> List[NanoResult]:
+        owner = dict(zip(prompts, thms))
         prompts = list(dict.fromkeys(prompts))
         if not prompts:
             return []
         self.stats["refreshes"] += len(prompts)
         self.stats["states_sent"] += len(prompts)
         for p, fresh in zip(prompts, self._call(prompts)):
+            self.ledger[owner[p]]["model_calls"] += 1
             old = self._cache.get(p)
             if old is None or old.error:
                 self._cache[p] = fresh
@@ -223,12 +236,13 @@ class NanoproofProvider(ActionProvider):
 
     def propose(self, reqs: List[ProposalRequest]) -> List[List[Candidate]]:
         prompts = [self.oracle.tactic_prompt(r.state) for r in reqs]
-        results = self.oracle.query(prompts)
-        stale = [p for p, r, res in zip(prompts, reqs, results)
-                 if not res.error and all(t in r.failed for t in res.tactics)]
+        thms = [r.state.thm_name for r in reqs]
+        results = self.oracle.query(prompts, thms)
+        stale = [(p, t) for p, t, r, res in zip(prompts, thms, reqs, results)
+                 if not res.error and all(x in r.failed for x in res.tactics)]
         if stale:
-            self.oracle.refresh(stale)
-            results = self.oracle.query(prompts)
+            self.oracle.refresh([p for p, _ in stale], [t for _, t in stale])
+            results = self.oracle.query(prompts, thms)
         out: List[List[Candidate]] = []
         for res in results:
             ranked = sorted(zip(res.tactics, res.logprobs), key=lambda tl: -tl[1])
@@ -247,6 +261,7 @@ class NanoproofValue(ValueProvider):
 
     def estimate(self, states: List[LeanState], goals: List[LeanGoal]) -> List[float]:
         per_state = [[] if s.solved else self.oracle.value_prompts(s) for s in states]
-        results = iter(self.oracle.query([p for ps in per_state for p in ps]))
+        results = iter(self.oracle.query([p for ps in per_state for p in ps],
+                                         [s.thm_name for s, ps in zip(states, per_state) for _ in ps]))
         return [sum(self.default if r.value is None else r.value for r in (next(results) for _ in ps))
                 for ps in per_state]  # solved states have no prompts -> 0.0

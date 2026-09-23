@@ -76,6 +76,7 @@ def test_value_then_propose_is_one_call_and_carries_logprobs():
     assert [c.tactic for c in cands] == ["exact ⟨h.2, h.1⟩", "constructor"]  # banned dropped, best first
     assert cands[0].provenance == "nanoproof" and cands[0].score == -0.2
     assert srv.calls == 1  # value query stocked the tactic cache
+    assert oracle.ledger["t"]["model_calls"] == 1  # ...and the theorem was charged once
 
 
 def test_solved_state_is_zero_without_a_call():
@@ -106,6 +107,17 @@ def test_resample_refreshes_and_merges():
     assert [c.tactic for c in c2] == ["exact ⟨h.2, h.1⟩", "constructor"] and srv.calls == 2
     assert NanoproofValue(oracle).estimate([s], [LeanGoal(THM)]) == [3.0] and srv.calls == 2
     assert oracle.stats["refreshes"] == 1
+    assert oracle.ledger["t"]["model_calls"] == 2  # the re-sample was a second model call
+
+
+def test_each_theorem_pays_for_a_shared_goal_once():
+    """A goal another theorem already cached is one server call but two charges:
+    per-theorem cost must not depend on what else ran (nanoproof pays per node)."""
+    srv, oracle = make({GOAL_A: [(["constructor"], [-1.0], 3.0)]})
+    s1, s2 = LeanState("t1", (GOAL_A,), ()), LeanState("t2", (GOAL_A,), ())
+    NanoproofValue(oracle).estimate([s1, s2, s1], [LeanGoal(THM)] * 3)
+    NanoproofProvider(oracle).propose([ProposalRequest(s2)])
+    assert srv.calls == 1 and oracle.ledger["t1"]["model_calls"] == 1 and oracle.ledger["t2"]["model_calls"] == 1
 
 
 def test_empty_sample_is_resampled():

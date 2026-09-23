@@ -76,9 +76,14 @@ through `ActsEnum.expand` — see tests).
 - `domain.py` — the `ActsEnum` domain: propose→validate→cache, resampling, stats.
 - `solve.py` — all theorems run as concurrent search instances (provider/value calls
   batch across the whole frontier); finished instances → path extraction
-  (`get_path`) → certification → `SolveResult`.
+  (`get_path`) → certification → `SolveResult`. Budgets `itr_max` (iterations) and
+  `calls_max` (model calls) are enforced through deepxube's `remove_instances`; costs
+  come from one ledger (`states.Ledger`, theorem → counters) that the domain charges
+  for REPL validations and the nanoproof oracle for model calls — each theorem pays
+  once per prompt it asks for, so its cost is what it would pay alone. The search
+  stops at the first proof (nanoproof's rule), not at deepxube's W-optimality bound.
 - `cli.py` — `dxlean solve` (nanoproof URL, backbone menu, value choice,
-  W/B/eps/cap/itr-max, results + verified-proof output) and `dxlean viz`.
+  W/B/eps/cap/itr-max/calls-max, results + verified-proof output) and `dxlean viz`.
 - `viz.py` — visualization of the environment and search process, all text-first
   on the REPL's pretty-printed goals: `render_state_goal` (matplotlib figure —
   backs the deepxube `StateGoalVizable` mixin on `LeanDomain`, which also
@@ -92,10 +97,12 @@ through `ActsEnum.expand` — see tests).
   plain callables plug in; the `PolicyFn` shape means `ActsPolicy` search variants
   (model-proposed edges + random exploration) are available later for free.
 - Solve loop: `make_instances(states, goals, inst_infos)` → `add_instances` →
-  `step()` until `remove_finished_instances(itr_max)` drains; per-instance
-  `inst_info` carries the theorem name.
-- `set_is_solved` runs on *popped* nodes; a solved child must be popped to register —
-  fine, it has h = 0 so it pops immediately.
+  `step()` until `remove_instances(done)` drains (`done`: solved, frontier drained,
+  or a budget hit); per-instance `inst_info` carries the theorem name.
+- `set_is_solved` runs on *popped* nodes, and a solved child (h = 0, f = W·g) is not
+  necessarily popped next when W > 1 or costs tie. `solve.py` therefore registers
+  solved nodes waiting in `_nodes_curr` / `open_set` itself via `record_goal`, so a
+  proof found within budget counts and is never dropped by a budget removal.
 
 ## Current status / known limits
 
@@ -115,10 +122,13 @@ through `ActsEnum.expand` — see tests).
 
 ## Roadmap
 
-1. **Benchmarks**: Mathlib-extracted dev corpus (volume, difficulty spread), then
-   miniF2F-test for citable numbers.
-2. **Harness grid**: {nanoproof MCTS reproduction, WA* W-sweep, batch-size sweep, eps
-   exploration} × {`--np-value` modes} with honest wall-clock/GPU accounting.
+1. **Benchmarks**: miniF2F valid/test exported by `scripts/export_minif2f.py` with
+   nanoproof's parsing, so `scripts/compare.py` joins its `theorems.jsonl` with
+   dxlean's `results.jsonl` by theorem (done); a Mathlib-extracted dev corpus for
+   volume and difficulty spread.
+2. **Harness grid**: nanoproof MCTS (`scripts/bench_nanoproof.sh`) vs {WA* W-sweep,
+   batch-size sweep, eps exploration} × {`--np-value` modes} (`scripts/bench_dxlean.sh`), all at the same
+   `--calls-max`; wall clock only once the REPL pool exists.
 3. **Scaling**: REPL worker pool with state affinity; persistent transition cache
    doubling as the harvest log.
 4. **Later**: expert iteration on the sampler; learned value via deepxube training

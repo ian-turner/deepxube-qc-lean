@@ -15,6 +15,7 @@ then drains and the search reports it unsolved.
 """
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
 from deepxube.base.domain import ActsEnum, StateGoalVizable, StringToAct
@@ -22,7 +23,7 @@ from matplotlib.figure import Figure
 
 from .providers import ActionProvider, Candidate, ProposalRequest
 from .repl import ApplyResult, REPLManager
-from .states import LeanGoal, LeanState, TacticAction
+from .states import LeanGoal, LeanState, Ledger, TacticAction
 
 StateKey = Tuple[str, str]
 
@@ -30,17 +31,19 @@ StateKey = Tuple[str, str]
 class LeanDomain(ActsEnum[LeanState, TacticAction, LeanGoal],
                  StateGoalVizable[LeanState, TacticAction, LeanGoal],
                  StringToAct[LeanState, TacticAction, LeanGoal]):
-    def __init__(self, repl: REPLManager, provider: ActionProvider, max_resamples: int = 2):
+    def __init__(self, repl: REPLManager, provider: ActionProvider, max_resamples: int = 2,
+                 ledger: Optional[Ledger] = None):
         super().__init__()
         self.repl = repl
         self.provider = provider
         self.max_resamples = max_resamples
+        self.ledger: Ledger = ledger if ledger is not None else defaultdict(Counter)
 
         self._actions: Dict[StateKey, List[TacticAction]] = {}
         self._successor: Dict[Tuple[StateKey, str], LeanState] = {}
         self._failed: Dict[StateKey, Set[str]] = {}
         self.stats: Dict[str, int] = {
-            "expansions": 0, "validations": 0, "valid": 0,
+            "expansions": 0, "valid": 0,
             "error": 0, "no_progress": 0, "timeout": 0, "resamples": 0,
         }
 
@@ -72,7 +75,7 @@ class LeanDomain(ActsEnum[LeanState, TacticAction, LeanGoal],
             tac = cand.tactic
             if tac in failed:
                 continue
-            self.stats["validations"] += 1
+            self.ledger[state.thm_name]["validations"] += 1
             res = self.repl.apply_tactic(state, tac)
             if res.state is not None and res.state == state:  # canonicalization missed a no-op
                 res = ApplyResult("no_progress", None, tac)

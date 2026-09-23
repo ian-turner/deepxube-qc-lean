@@ -290,7 +290,7 @@ def traced_search(theorem: TheoremSpec, repl: REPLManager, domain: LeanDomain,
         print(f"proof: {' ; '.join(tactics)}")
     else:
         print(f"\nUNSOLVED after {instance.itr} iterations "
-              f"({'frontier exhausted' if instance.frontier_size() == 0 else 'iteration limit'})")
+              f"({'frontier exhausted' if instance.finished() else 'iteration limit'})")
     print("stats: " + ", ".join(f"{k}={v}" for k, v in domain.stats.items()))
 
     if fig_path is not None:

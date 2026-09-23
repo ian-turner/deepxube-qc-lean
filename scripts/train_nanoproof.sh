@@ -38,7 +38,12 @@
 #   NP_WARMUP_WAIT    seconds to let leanserver import Mathlib before RL/eval (default 900)
 #   NP_PORT           leanserver port                (default 8000)
 #   NP_FORCE          1 = re-run a training stage even if it already has a checkpoint
-#   NP_CKPT           checkpoint for serve (default: newest rl, else newest sft)
+#   NP_CKPT           checkpoint for serve and eval (default: newest rl, else newest sft);
+#                     pin the same file for both when benchmarking against dxlean
+#   NP_NUM_SIMULATIONS eval MCTS simulations per theorem (default 512)
+#   NP_SPLIT          eval MiniF2F split, valid or test (default valid)
+#   NP_EVAL_EXTRA_ARGS extra prover_eval.py args, e.g. "--max-theorems 20" for a pilot,
+#                     "--force" to redo an eval dir that already has results
 #   NP_INFER_PORT     serve port                       (default 5001)
 #   NP_NUM_SAMPLES    tactics sampled per state         (default 6, nanoproof's own)
 #   NP_FIRST_TOKEN_CAP max samples sharing a first token (default 2; empty = off)
@@ -322,16 +327,27 @@ do_rl() {
 }
 
 do_eval() {
-    local ckpt; ckpt="$(latest_ckpt rl || true)"
+    # nanoproof's own MCTS harness (scripts/prover_eval.py); the sampler settings are
+    # the same env vars `serve` uses, so a dxlean run against `serve` sees the same
+    # model behaviour. Writes <ckpt dir>/eval_<step>_minif2f[-test]_<sims>/ (theorems.jsonl
+    # + summary.toml) for scripts/compare.py; one dir per simulation budget.
+    local ckpt="${NP_CKPT:-}"
+    [ -n "$ckpt" ] || ckpt="$(latest_ckpt rl || true)"
     [ -n "$ckpt" ] || ckpt="$(latest_ckpt sft)"
     [ -n "$ckpt" ] || die "no checkpoint to evaluate"
+    local sims="${NP_NUM_SIMULATIONS:-512}" split="${NP_SPLIT:-valid}"
+    local solvers=""; [ "$DISABLE_SOLVERS" = "1" ] && solvers="--disable-solvers"
     do_leanproj; do_leanserver
-    log "eval: MiniF2F-Valid, 512 simulations, $ckpt"
+    log "eval: MiniF2F-$split, $sims simulations, $ckpt"
     ( cd "$NP_REPO" && "$PY" scripts/prover_eval.py \
         --model-path "$ckpt" \
         --lean-servers "127.0.0.1:$PORT" \
-        --datasets minif2f --split valid \
-        --num-simulations 512 )
+        --lean-project "$LEAN_PROJECT" \
+        --datasets minif2f --split "$split" \
+        --num-simulations "$sims" --output-suffix "_$sims" \
+        --num-sampled-tactics "$NUM_SAMPLES" \
+        --first-token-occurrences-cap "${FIRST_TOKEN_CAP:-none}" \
+        $solvers ${NP_EVAL_EXTRA_ARGS:-} )
 }
 
 # ------------------------------------------------------------- serve --------

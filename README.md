@@ -71,10 +71,45 @@ restart.
 Key knobs: `--weight` (on path cost: `W*g + h`, lower = greedier), `--batch` (nodes
 expanded per search iteration per theorem), `--cap` (max candidates REPL-validated per
 state), `--resamples` (re-proposal rounds with failure feedback before a state is a dead
-end), `--itr-max` (search budget per theorem).
+end), `--itr-max` (search iterations per theorem), `--calls-max` (model calls per theorem).
 
-Results land in `--out`: `results.jsonl` plus `proofs/<name>.lean` for every proof
-that passed certification.
+Results land in `--out`: `results.jsonl` (per theorem: solved/verified, tactics,
+iterations, `model_calls`, `validations`), `summary.json` (run totals, wall time,
+arguments) and `proofs/<name>.lean` for every proof that passed certification.
+
+## Benchmarking against nanoproof's MCTS
+
+Same checkpoint, same theorems, same Lean environment, same budget currency. nanoproof's
+MCTS spends one model call per simulation; dxlean charges each theorem one call per
+prompt it asks for (one per goal under `--np-value sum`, cached by goal text, and a
+goal another theorem already cached still costs), so `--calls-max` is the budget that
+compares across harnesses. Iterations do not: deepxube scores every generated child and
+expands only the ones it pops. The search stops at the first proof, like nanoproof.
+
+```bash
+# 1. theorems: miniF2F parsed exactly like nanoproof's loader, so names match its ids
+scripts/export_minif2f.py        # problems/minif2f_{valid,test}.jsonl + minif2f_header.lean
+
+# 2. nanoproof's own MCTS, on the cluster (prover_eval.py; BUDGET simulations, default 512)
+NP_CKPT=<model_NNNNNN.pt> scripts/bench_nanoproof.sh
+#    -> <checkpoint dir>/eval_<step>_minif2f_512/{theorems.jsonl,summary.toml}
+
+# 3. deepxube A*: the same checkpoint served, one `dxlean solve` per GRID variant at --calls-max BUDGET
+NP_CKPT=<model_NNNNNN.pt> GRID="w1.0 w0.5 b4 vfirst" scripts/bench_dxlean.sh
+#    -> results/minif2f_valid_512/<variant>/{results.jsonl,summary.json,proofs/}
+
+# 4. join by theorem: solve rates, solved-within-budget curve, per-theorem disagreements
+scripts/compare.py <checkpoint dir>/eval_<step>_minif2f_512 results/minif2f_valid_512/*/
+```
+
+The exact `dxlean solve` flags are in [bench_dxlean.sh](scripts/bench_dxlean.sh) (`--backbone ""`,
+the Mathlib project, the header file, `--calls-max`). Pilot first with `PILOT=20 BUDGET=64` on
+both scripts, which take the same first theorems: a cold `import Mathlib` costs minutes per REPL
+start. Wall clock is not comparable yet, since nanoproof drives two dozen Lean workers in
+parallel while dxlean validates through one REPL process; compare model calls and validations.
+Both scripts read the same sampler settings (`NP_NUM_SAMPLES`, `NP_FIRST_TOKEN_CAP`,
+`NP_DISABLE_SOLVERS`); under `NP_DISABLE_SOLVERS=1` nanoproof's eval also appends `grind` to
+every expansion, which `--backbone grind` mirrors.
 
 ## Visualization
 
