@@ -39,7 +39,7 @@ re-proposed up to `--resamples` times with the failed set surfaced to the provid
 action list, the instance's frontier drains and it finishes unsolved (verified to flow
 through `ActsEnum.expand` — see tests).
 
-## Components (src/dxlean/)
+## Components (dxlean/)
 
 - `repl.py` — leanprover-community REPL adapter. JSON-over-stdio protocol (verified
   v4.30.0): `{"cmd"}` → env/sorries, `{"tactic","proofState"}` → new state or
